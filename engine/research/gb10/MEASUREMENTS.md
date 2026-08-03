@@ -3405,3 +3405,153 @@ verified (`systemctl is-active`=`active`, `GET /v1/models`->HTTP 200,
 `deepseek-v4-flash`/`context_length: 32768` present, confirming the
 production `ExecStart` -- `--ssd-streaming-cache-experts 75GB --ctx 32768`
 -- untouched) after.
+
+### Upstream pair filed (2026-08-03)
+
+Fix verified end-to-end on `upstream/main` too (branch `dspark-greedy-identity`,
+based on upstream `54b36ed`): upstream already loads this DSpark drafter GGUF
+natively (its `mtp.*`-named tensors plus `dspark.*` metadata are both parsed by
+current upstream `main`), so the same byte-identical drafter-vs-no-drafter test
+(two prompts, 400 and 800 tokens) ran directly on upstream, not just on this fork.
+Also confirmed the bug reproduces on *unpatched* upstream `main` before applying
+the fix (drafter-enabled TCP-handshake response diverges from no-drafter within
+the first couple of sentences) -- so this is not fork-specific.
+
+- Issue: https://github.com/antirez/ds4/issues/658
+- PR: https://github.com/antirez/ds4/pull/659 (`nexus-cw:dspark-greedy-identity` ->
+  `antirez/ds4:main`)
+- Cross-link comment on the issue: https://github.com/antirez/ds4/issues/658#issuecomment-5160350475
+
+**Server discipline (upstream verification window).** Building/testing the
+`dspark-greedy-identity` branch and the pre-fix upstream reproduction both used
+this same checkout (`~/src/ds4`), which is also `ds4-server`'s
+`WorkingDirectory`/binary source -- `ds4-server` was stopped for the entire
+window (multiple checkouts: upstream/main pre-fix, `dspark-greedy-identity`
+post-fix, back to `research/gb10`), and `research/gb10` was rebuilt
+(`make clean && make cuda-spark`, clean, zero warnings) and the server
+restarted + verified (`systemctl is-active`=`active`, `GET /v1/models`->200,
+`deepseek-v4-flash`/`context_length: 32768`, confirming the production
+`ExecStart` was untouched) before any GitHub API calls were made.
+
+## posix_fadvise A/B on the SSD-streaming read path (2026-08-02)
+
+New env knob `DS4_STREAM_FADVISE` (commit adds it to `ds4_cuda.cu`), default unset =
+behavior unchanged. `random` -> `POSIX_FADV_RANDOM` once when the streaming fd is
+registered (`ds4_gpu_set_model_fd`); `dontneed`/`all` -> RANDOM at open **plus**
+`POSIX_FADV_DONTNEED` on each buffered pread's page-rounded range immediately after the
+read completes (`cuda_model_stage_read`). Both guarded on `POSIX_FADV_*` presence so
+non-Linux builds compile unchanged.
+
+**Hypothesis (stated before the run).** At the warm 96% expert-cache hit rate, the OS page
+cache may be silently serving the rare warm *misses* that would otherwise hit RAM; so
+`DONTNEED` (which evicts just-read pages) could *hurt* warm-miss latency, while `RANDOM`
+(disabling readahead) might help cold scattered reads. Test whether either moves cold TTFT,
+warm tok/s, or the page-cache footprint.
+
+**Protocol.** Same 8-turn long-session REPL protocol as the GA-0731 warm-baseline unit
+(`research/gb10/session_prompts.txt`, `-n 350`, `--cuda --ssd-streaming
+--ssd-streaming-cache-experts 75GB --nothink`), model
+`gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf`, `ds4-server` stopped. Page cache dropped
+(`echo 3 > drop_caches`) before every arm so each starts equal; `free -h` + `/proc/meminfo`
+captured before/after with a 2s background sampler. `DS4_CUDA_STREAM_STATS=1` set but, as
+in prior long-session units, that counter is not wired into the REPL/stdin path (only the
+one-shot `-p` path) -- no direct hit-rate counter available; not re-derived here since the
+arms are same-model same-budget and the question is a *delta*, not an absolute. Cold metric =
+turn-1 (post-drop) decode t/s; a discrete sub-token TTFT was not separately instrumented
+(turn-1 prefill/decode stands in, consistent with earlier units). A vs C came out <5% apart
+on warm tok/s, so both were re-run once (A2, C2) to bound noise.
+
+| arm | DS4_STREAM_FADVISE | cold turn-1 decode t/s | warm steady t/s (turns 6-8 mean) | turns 2-8 mean | Cached after (GB) | MemAvailable after (GB) |
+|---|---|---|---|---|---|---|
+| A  | unset (baseline) | 4.87 | 5.69 | 5.71 | 14.3 | 117.5 |
+| A2 | unset (baseline) | 5.02 | 5.51 | 5.63 | 13.0 | 117.4 |
+| B  | random | 5.26 | 5.58 | 5.65 | 13.8 | 117.4 |
+| C  | random,dontneed | 5.18 | 5.54 | 5.62 | 13.3 | 117.4 |
+| C2 | random,dontneed | 5.00 | 5.59 | 5.65 | 13.9 | 117.3 |
+
+Baseline (A) pre-drop Cached was ~0.27 GB in every arm; the "Cached after" column is the
+page cache the session leaves resident. Cold prefill was 0.5-0.7 t/s across all arms
+(indistinguishable). Warm-steady means: baseline 5.60 (mean of A,A2), random 5.58, both
+5.565 (mean of C,C2) -- a spread of <1% across all three conditions, smaller than the ~3%
+run-to-run noise visible within the baseline pair alone (5.69 vs 5.51).
+
+**Verdict: no measurable effect, in throughput OR page-cache footprint.** RANDOM and
+RANDOM+DONTNEED move warm tok/s by less than the baseline's own rep-to-rep noise, and the
+page cache the session retains at exit is ~13-14 GB in *every* arm including baseline --
+DONTNEED did not shrink it. The pre-registered "DONTNEED hurts warm misses" hypothesis is
+**not confirmed** (no warm regression), but neither hint helps.
+
+**Mechanistic reason (the real finding).** The hints are largely inert because the
+production streaming read path does not primarily go through the buffered fd they target.
+`ds4_gpu_set_model_fd` opens a second `O_DIRECT` fd (`g_model_direct_fd`) and
+`cuda_model_stage_read` prefers it; `O_DIRECT` bypasses the page cache entirely, so the
+buffered `pread(g_model_fd, ...)` fallback -- the only path where our `POSIX_FADV_DONTNEED`
+fires -- runs rarely, and `POSIX_FADV_RANDOM` on a cache that O_DIRECT already sidesteps
+does nothing. The ~14 GB the session leaves cached is dominated by touched mmap'd
+model-view pages (the `posix_madvise(DONTNEED)` on the *mapping* already handles those),
+not the pread buffer. More fundamentally: at 75GB budget the warm 96% hit rate is served by
+the **in-process device-side expert LRU**, not the OS page cache, so page-cache tuning via
+fadvise is orthogonal to warm-hit performance here. Page cache is *not* the load-bearing
+tier at this budget; fadvise hints on this path are a no-op and can be left default-off.
+
+**Server restored:** `sudo systemctl start ds4-server`, `systemctl is-active`=active,
+`curl localhost:8000/v1/models`=200 confirmed before finishing.
+
+## O_DIRECT engagement verification (2026-08-03)
+
+**Question.** Does the O_DIRECT read path actually engage on the unaligned MXFP4 GGUF
+(general.alignment = 32, tensor offsets essentially never 512B-aligned), or does it
+silently fall back to buffered reads?
+
+**Verdict: (a) O_DIRECT engages, via correct read-widening.**
+
+**Code trace (ds4_cuda.cu @ 573cb1c).**
+- `ds4_gpu_set_model_fd` (ds4_cuda.cu:4234) reopens the model via
+  `/proc/self/fd/N` with `O_RDONLY|O_DIRECT` (ds4_cuda.cu:4258); on open failure it
+  leaves `g_model_direct_fd=-1` and the path cleanly degrades to buffered.
+  Alignment = `st_blksize`, floored to 512 (ds4_cuda.cu:4247,4261). Opt-out env:
+  `DS4_CUDA_NO_DIRECT_IO` (ds4_cuda.cu:4255).
+- `cuda_model_stage_read` (ds4_cuda.cu:2035) does read-widening: rounds the offset
+  down and the length up to the alignment (ds4_cuda.cu:2041-2043), preads the widened
+  range into the staging buffer, and returns `payload = stage + delta`
+  (ds4_cuda.cu:2050) -- a pointer-offset bounce, no extra copy.
+- Guards before the direct pread (ds4_cuda.cu:2044-2046): widened read must fit the
+  staging buffer and must not extend past EOF; otherwise the read silently uses the
+  buffered fd (ds4_cuda.cu:2069). On EINVAL/EFAULT/ENOTSUP from the direct pread the
+  direct fd is closed and direct I/O permanently disabled for the process
+  (ds4_cuda.cu:2055-2061) -- logged only under `DS4_CUDA_WEIGHT_CACHE_VERBOSE`; there
+  is NO counter for either fallback.
+- Staging buffers are `cudaMallocHost` (page-aligned) plus `cuda_align_ptr` to the
+  direct alignment (ds4_cuda.cu:2008, 2115), and are sized chunk + align
+  (ds4_cuda.cu:2154-2155) so the widened read always fits. Buffer alignment is
+  therefore always satisfied.
+
+**Runtime proof (robo-dog, ext4, kernel 6.17.0-1021-nvidia, production flags).**
+- fdinfo of ds4-server pid 1844871: fd 4 flags 0400000 = O_RDONLY|O_LARGEFILE
+  (buffered), fd 34 flags 0600000 = +O_DIRECT (arm64 O_DIRECT = 0200000).
+- strace attach (`-f -e trace=pread64`) over one 120-token streaming generation:
+  **16995 preads on fd 34 (O_DIRECT), every one with offset AND length 512-aligned,
+  zero errors; exactly 1 pread on buffered fd 4.** Read sizes on fd 34: 4096 to
+  35655680 bytes (expert-tensor chunks).
+- The single fd-4 pread (16384 bytes at 156378328608) ends exactly at EOF
+  (file size 156378344992): the widened read would cross EOF, so the
+  ds4_cuda.cu:2046 tail guard correctly routed it to the buffered fd. Working as
+  designed, not a silent-fallback bug.
+- EINVAL probe: standalone O_DIRECT open of the same gguf on the same fs/kernel;
+  preads at 512-aligned offsets succeed, preads at offsets mod 512 = 33 and 64 fail
+  with errno 22 EINVAL. The alignment constraint is real here; the widening is what
+  makes the path work.
+
+**Implications.**
+- Task #22 tiers: the O_DIRECT tier is already real on the current unaligned GGUF --
+  no dependency on alignment for correctness or engagement. Widening overhead is at
+  most align-1 = 511 bytes per edge, negligible against multi-MB expert reads.
+- Task #14 4KB-alignment repack: not needed to make O_DIRECT engage (it already
+  does). Its remaining value is eliminating the up-to-511B-per-edge waste and
+  enabling a larger (4KB) direct alignment cleanly, not unlocking tier 2.
+- Caveat worth remembering: both fallback paths (guard-miss and EINVAL-disable) are
+  silent with no counter; only `DS4_CUDA_WEIGHT_CACHE_VERBOSE` surfaces the disable
+  event. A one-word stats counter would make future regressions visible.
+
+**Server state:** verification used strace attach on the live service (no stop);
+`curl localhost:8000/v1/models` = 200 after detach.
