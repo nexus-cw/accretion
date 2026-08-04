@@ -1,0 +1,27 @@
+# accretion ds4-server systemd unit (template).
+# Configuration lives in /opt/accretion/etc/ds4-server.env — edit that, not this.
+# Flags mirror the production-proven GB10 invocation.
+[Unit]
+Description=accretion ds4-server (LLM inference)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/accretion/etc/ds4-server.env
+ExecStartPre=/usr/bin/mkdir -p ${DS4_KV_DIR}
+ExecStart=/opt/accretion/bin/ds4-server \
+  -m ${DS4_MODEL} \
+  --cuda --ssd-streaming \
+  --ssd-streaming-cache-experts ${DS4_EXPERT_CACHE} \
+  --host ${DS4_HOST} --port ${DS4_PORT} \
+  --ctx ${DS4_CTX} \
+  --batched-session ${DS4_SESSIONS} \
+  --kv-disk-dir ${DS4_KV_DIR} \
+  --kv-disk-space-mb ${DS4_KV_SPACE_MB}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

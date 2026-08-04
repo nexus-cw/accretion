@@ -11,6 +11,35 @@ DwarfStar (ds4) is the engine; Accretion is the platform around it. The split is
 
 Early. Seeded from the nexus-cw/ds4 `platform` branch. Running in production on a GB10 serving DeepSeek V4 Flash MXFP4 at 5-6 tok/s from a 156GB GGUF with a 75GB expert cache.
 
+## Install
+
+Consumers never build code — download a release, run the installer. Current
+target: `gb10-arm64-cuda` (GB10 / DGX Spark). Other targets (generic arm64
+CUDA, x86_64 CUDA, Apple/Metal) are planned; see `docs/RELEASING.md`.
+
+```sh
+# 1. Download the latest release tarball (and .sha256) from
+#    https://github.com/nexus-cw/accretion/releases
+tar xzf accretion-<version>-gb10-arm64-cuda.tar.gz
+cd accretion-<version>-gb10-arm64-cuda
+
+# 2. Install (idempotent; never overwrites an existing config)
+sudo ./install.sh
+
+# 3. Configure: set DS4_MODEL (and any tuning) then start
+sudoedit /opt/accretion/etc/ds4-server.env
+sudo systemctl enable --now ds4-server
+
+# 4. Point your harness at it (Anthropic-compatible API)
+export ANTHROPIC_BASE_URL=http://<host>:8000
+export ANTHROPIC_API_KEY=none   # accepted but unused
+claude   # or any Anthropic-API client
+```
+
+`sudo ./uninstall.sh` removes it (config kept unless `--purge`). Coming next:
+a web console (#27) and a model downloader with setup-and-optimize UX, so
+"pick a model" is a browser action rather than an env file.
+
 ## Architecture sketch
 
 - `engine/` — ds4 with expert streaming + CUDA expert LRU (subtree of nexus-cw/ds4 `platform`).
