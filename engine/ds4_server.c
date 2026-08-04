@@ -4,6 +4,10 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* CUDA-only expert-cache byte counters for /v1/capabilities. */
+#include "ds4_gpu.h"
+#endif
 
 /* OpenAI/Anthropic compatible local server.
  *
@@ -8294,6 +8298,10 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* Honest-capability snapshot: computed once at startup from the loaded
+     * GGUF + engine config; served by GET /v1/capabilities. */
+    ds4_capabilities caps;
+    uint64_t session_ctx_bytes;
 };
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -10272,8 +10280,17 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
-static int server_prefill_quantum_for(bool generation_active) {
-    int quantum = generation_active ? 128 : 2048;
+/* Idle (no generation active) prefill quantum follows the engine's prefill
+ * chunk when that is larger than the historical 2048 default: on the CUDA
+ * SSD-streaming path every engine prefill call re-streams roughly the whole
+ * routed expert set from NVMe, so slicing sync into quanta smaller than the
+ * engine chunk multiplies prefill I/O (task#29: 2048 = 26 t/s vs 8192 =
+ * 63 t/s on a cold 22k prompt).  The mixed quantum (generation active)
+ * stays small for interactivity.  Env overrides win in both cases. */
+static int server_prefill_quantum_for2(bool generation_active,
+                                       int idle_default) {
+    if (idle_default < 2048) idle_default = 2048;
+    int quantum = generation_active ? 128 : idle_default;
     const char *env = getenv(generation_active ?
                              "DS4_SERVER_MIXED_PREFILL_QUANTUM" :
                              "DS4_SERVER_PREFILL_QUANTUM");
@@ -10291,7 +10308,8 @@ static int server_prefill_quantum(server *s) {
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
     pthread_mutex_unlock(&s->model_mu);
-    return server_prefill_quantum_for(generation_active);
+    return server_prefill_quantum_for2(generation_active,
+                                       (int)ds4_engine_prefill_chunk(s->engine));
 }
 
 /* Synchronize one resident slot without monopolizing the model executor.  A
@@ -10854,6 +10872,16 @@ static long server_decode_coalesce_us(void) {
     return us;
 }
 
+/* Batched decode kill switch.  DS4_SCHED_BATCH_DECODE=0 forces the decode
+ * worker to step one session at a time (batch size 1) while keeping the
+ * prefill-quantum interleaving intact.  Default is on in batched mode; the
+ * switch exists for A/B measurement and as an operator opt-out. */
+static bool server_batch_decode_enabled(void) {
+    const char *env = getenv("DS4_SCHED_BATCH_DECODE");
+    if (env && env[0] && !strcmp(env, "0")) return false;
+    return true;
+}
+
 static void timespec_add_us(struct timespec *ts, long us) {
     if (!ts || us <= 0) return;
     ts->tv_nsec += (us % 1000000L) * 1000L;
@@ -10865,7 +10893,8 @@ static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
-    const long coalesce_us = server_decode_coalesce_us();
+    const bool batch_enabled = server_batch_decode_enabled();
+    const long coalesce_us = batch_enabled ? server_decode_coalesce_us() : 0;
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
     pthread_mutex_lock(&s->model_mu);
@@ -10906,6 +10935,7 @@ static void *decode_worker_main(void *arg) {
             items[count].session = slot->session;
             items[count].token = slot->decode_token;
             count++;
+            if (!batch_enabled) break;
         }
         if (count == 0) continue;
         s->model_busy = true;
@@ -11183,6 +11213,24 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                                     ds4_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+    } else if (cached == 0 &&
+               s->kv.enabled &&
+               s->kv.opt.deep_cold_anchor &&
+               s->kv.opt.cold_max_tokens > 0 &&
+               prompt_for_sync->len > s->kv.opt.cold_max_tokens)
+    {
+        /* Deep canonical prompt anchor (operator "LAYER 1"): prompts beyond
+         * cold_max_tokens otherwise get only continued/evict anchors keyed by
+         * the post-generation token stream (hidden thinking included), which a
+         * re-send or fresh shared-prefix request — whose replayed transcript is
+         * thinking-stripped — can never match, forcing a full re-prefill every
+         * time.  The incoming prompt text is already the canonical (API-visible,
+         * thinking-stripped, template-normalized) form, so store the aligned
+         * near-full prompt prefix as a "cold" anchor keyed by that text.  The
+         * next request that shares this canonical prefix content-addresses it
+         * and restores with a tail-only prefill.  Cost is bounded by the disk
+         * budget, LRU eviction, and pinning. */
+        cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -12361,6 +12409,126 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+/* GET /v1/capabilities (also /capabilities): machine-readable truth about
+ * what this server actually is -- trained vs configured context, quantization
+ * actually served per tensor category, expert-cache budget vs counted bytes,
+ * KV disk store state, API surface.  Static facts come from the startup
+ * snapshot (s->caps); dynamic figures are O(1) counter reads.  No GPU work,
+ * safe to poll. */
+static bool send_capabilities(server *s, int fd) {
+    const ds4_capabilities *c = &s->caps;
+    buf b = {0};
+
+    buf_puts(&b, "{\"schema_version\":1,\"model\":{\"name\":");
+    json_escape(&b, c->model_name);
+    buf_puts(&b, ",\"architecture\":");
+    json_escape(&b, c->architecture[0] ? c->architecture : "unknown");
+    buf_printf(&b,
+        ",\"parameters\":%llu,\"file_bytes\":%llu,\"quantization\":[",
+        (unsigned long long)c->parameters,
+        (unsigned long long)c->file_bytes);
+    bool first = true;
+    for (int i = 0; i < c->quant_category_count; i++) {
+        if (c->quant[i].tensors == 0) continue;
+        if (!first) buf_putc(&b, ',');
+        first = false;
+        buf_puts(&b, "{\"category\":");
+        json_escape(&b, c->quant[i].category);
+        buf_puts(&b, ",\"quants\":");
+        json_escape(&b, c->quant[i].quants);
+        buf_printf(&b, ",\"tensors\":%llu,\"bytes\":%llu}",
+                   (unsigned long long)c->quant[i].tensors,
+                   (unsigned long long)c->quant[i].bytes);
+    }
+    buf_puts(&b, "]},");
+
+    /* The honest-context centerpiece: "configured" is what --ctx asked for,
+     * "trained" is where the model was actually trained (RoPE original
+     * context if the file declares one, else the declared context_length). */
+    const unsigned long long trained =
+        c->rope_original_context_length ? c->rope_original_context_length
+                                        : c->trained_context_length;
+    buf_printf(&b,
+        "\"context\":{\"configured\":%d,\"trained\":%llu,"
+        "\"rope\":{\"original_context_length\":%llu,"
+        "\"declared_context_length\":%llu,"
+        "\"scaling_factor\":%.6g,\"freq_base\":%.6g}},",
+        s->ctx_size,
+        trained,
+        (unsigned long long)c->rope_original_context_length,
+        (unsigned long long)c->trained_context_length,
+        (double)c->rope_scaling_factor,
+        (double)c->rope_freq_base);
+
+    buf_printf(&b,
+        "\"serving\":{\"ssd_streaming\":%s,\"ssd_streaming_cold\":%s,"
+        "\"batched_mode\":%s,\"batched_sessions\":%d,"
+        "\"session_context_buffer_bytes_estimated\":%llu,"
+        "\"expert_cache\":{\"budget_bytes\":%llu",
+        c->ssd_streaming ? "true" : "false",
+        c->ssd_streaming_cold ? "true" : "false",
+        s->batched_mode ? "true" : "false",
+        s->slot_count,
+        (unsigned long long)s->session_ctx_bytes,
+        (unsigned long long)c->expert_cache_budget_bytes);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Task-18 byte-accounting self-report figures (same sources as the
+     * DS4_CUDA_STREAM_STATS memory line). CUDA-only counters. */
+    {
+        const unsigned long long counted =
+            (unsigned long long)ds4_gpu_stream_expert_cache_counted_bytes();
+        const unsigned long long parked =
+            (unsigned long long)ds4_gpu_stream_expert_cache_parked_bytes();
+        buf_printf(&b,
+            ",\"live_budget_bytes\":%llu,\"counted_bytes\":%llu,"
+            "\"pool_parked_bytes\":%llu,\"device_total_bytes\":%llu,"
+            "\"entries\":%u,\"configured_experts\":%u",
+            (unsigned long long)ds4_gpu_stream_expert_cache_budget_bytes(),
+            counted, parked, counted + parked,
+            ds4_gpu_stream_expert_cache_current_count(),
+            ds4_gpu_stream_expert_cache_configured_count());
+    }
+#endif
+    buf_puts(&b, "},\"kv_disk_store\":{");
+    pthread_mutex_lock(&s->kv_mu);
+    buf_printf(&b,
+        "\"enabled\":%s,\"budget_bytes\":%llu,"
+        "\"pinning\":%s,\"pin_min_hits\":%d,\"entries\":%d}},",
+        s->kv.enabled ? "true" : "false",
+        (unsigned long long)s->kv.budget_bytes,
+        s->kv.pin_min_hits > 0 ? "true" : "false",
+        s->kv.pin_min_hits,
+        s->kv.len);
+    pthread_mutex_unlock(&s->kv_mu);
+
+    /* Reference throughput is only reported when the operator supplies
+     * measured numbers (DS4_CAPS_THROUGHPUT_JSON, a JSON object).  The
+     * server never benchmarks at request time and never fabricates a
+     * figure -- absent a real source the field is omitted. */
+    const char *tp = getenv("DS4_CAPS_THROUGHPUT_JSON");
+    if (tp && tp[0] == '{') {
+        buf_puts(&b, "\"throughput\":");
+        buf_puts(&b, tp);
+        buf_putc(&b, ',');
+    }
+
+    buf_printf(&b,
+        "\"apis\":{\"openai_chat_completions\":true,"
+        "\"openai_completions\":true,\"openai_responses\":true,"
+        "\"anthropic_messages\":true,\"count_tokens\":false,"
+        "\"sse_streaming\":true,"
+        "\"speculative\":{\"mtp\":%s,\"mtp_active\":%s,"
+        "\"mtp_draft_tokens\":%d,\"dspark\":%s}}}\n",
+        c->has_mtp ? "true" : "false",
+        (c->has_mtp && !s->batched_mode) ? "true" : "false",
+        c->mtp_draft_tokens,
+        c->dspark ? "true" : "false");
+
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -12390,6 +12558,14 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/v1/capabilities") ||
+         !strcmp(hr.path, "/capabilities")))
+    {
+        send_capabilities(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -12901,6 +13077,18 @@ int main(int argc, char **argv) {
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
     cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
+    /* Task#29: bulk prefill on the CUDA SSD-streaming path is NVMe-bound via
+     * expert-cache capacity thrash -- every prefill chunk re-streams roughly
+     * the whole routed expert set, so per-token I/O scales inversely with
+     * chunk size.  Measured on robo-dog (22k cold prompt): chunk 2048 =
+     * 26 t/s, 4096 = 43 t/s, 8192 = 63 t/s (2.4x); 16384 fails in the
+     * attention batch encoder and is rejected.  Default the engine prefill
+     * chunk to 8192 for this configuration; --prefill-chunk still overrides. */
+    if (cfg.engine.prefill_chunk == 0 &&
+        cfg.engine.ssd_streaming &&
+        cfg.engine.backend == DS4_BACKEND_CUDA) {
+        cfg.engine.prefill_chunk = 8192;
+    }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
@@ -12958,6 +13146,16 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    ds4_engine_capabilities(engine, &s.caps);
+    {
+        const ds4_context_memory cm =
+            ds4_context_memory_estimate_with_prefill_mode(
+                cfg.engine.backend,
+                cfg.ctx_size,
+                ds4_engine_prefill_chunk(engine),
+                cfg.engine.ssd_streaming);
+        s.session_ctx_bytes = cm.total_bytes;
+    }
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -13002,11 +13200,14 @@ int main(int argc, char **argv) {
     }
     if (s.batched_mode) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
+                   "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld batch_decode=%d",
                    s.slot_count,
-                   server_prefill_quantum_for(false),
-                   server_prefill_quantum_for(true),
-                   server_decode_coalesce_us());
+                   server_prefill_quantum_for2(
+                       false, (int)ds4_engine_prefill_chunk(engine)),
+                   server_prefill_quantum_for2(
+                       true, (int)ds4_engine_prefill_chunk(engine)),
+                   server_decode_coalesce_us(),
+                   server_batch_decode_enabled() ? 1 : 0);
         if (ds4_engine_has_mtp(engine)) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
@@ -16457,6 +16658,33 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_kv_cache_pinning_predicate(void) {
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    ds4_kvstore_entry cold = {0};
+    cold.reason = DS4_KVSTORE_REASON_COLD;
+    cold.hits = 3;
+    ds4_kvstore_entry cont = {0};
+    cont.reason = DS4_KVSTORE_REASON_CONTINUED;
+    cont.hits = 100;
+
+    /* Default: pinning disabled, nothing is pinned. */
+    TEST_ASSERT(!ds4_kvstore_entry_pinned(&kc, &cold));
+    TEST_ASSERT(!ds4_kvstore_entry_pinned(&kc, &cont));
+
+    kc.pin_min_hits = 3;
+    TEST_ASSERT(ds4_kvstore_entry_pinned(&kc, &cold));
+    cold.hits = 2;
+    TEST_ASSERT(!ds4_kvstore_entry_pinned(&kc, &cold));
+    /* Continued waypoints are never pinned regardless of hits. */
+    TEST_ASSERT(!ds4_kvstore_entry_pinned(&kc, &cont));
+
+    ds4_kvstore_entry evict = {0};
+    evict.reason = DS4_KVSTORE_REASON_EVICT;
+    evict.hits = 3;
+    TEST_ASSERT(ds4_kvstore_entry_pinned(&kc, &evict));
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -17506,6 +17734,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_pinning_predicate();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();

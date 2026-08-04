@@ -62,6 +62,14 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    /* When true, store a canonical prompt-prefix ("cold") anchor for prompts
+     * that exceed cold_max_tokens too, using the aligned near-full boundary.
+     * The key is the incoming request's rendered prompt text, which is already
+     * the API-visible, thinking-stripped, template-normalized (canonical) form,
+     * so a later re-send or shared-prefix request content-addresses and
+     * restores it.  Bounded by the disk budget + eviction + pinning.
+     * DS4_KV_DEEP_COLD_ANCHOR=0 disables. Default on. */
+    bool deep_cold_anchor;
 } ds4_kvstore_options;
 
 typedef struct {
@@ -70,6 +78,8 @@ typedef struct {
     uint64_t budget_bytes;
     bool reject_different_quant;
     ds4_kvstore_options opt;
+    /* DS4_KV_PIN_MIN_HITS; 0 = pinning disabled (default). */
+    int pin_min_hits;
     int continued_last_store_tokens;
     ds4_kvstore_entry *entry;
     int len;
@@ -150,6 +160,7 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
                                 uint64_t trailer_bytes,
                                 uint64_t *file_bytes_out,
                                 uint64_t *required_bytes_out);
+bool ds4_kvstore_entry_pinned(const ds4_kvstore *kc, const ds4_kvstore_entry *e);
 double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
                                         uint64_t now,
