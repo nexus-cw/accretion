@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ds4 console</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warm:#d29922}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;max-width:860px;margin:0 auto;padding:1.5rem 1rem}
+h1{font-size:1.3rem;margin-bottom:.25rem}
+h1 small{color:var(--dim);font-weight:400;font-size:.8rem;margin-left:.5rem}
+section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:1rem;margin-top:1rem}
+h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:.75rem}
+.kv{display:flex;gap:.75rem;padding:.2rem 0}
+.kv span{color:var(--dim);min-width:9rem}
+.kv.ctx b{color:var(--acc)}
+.bar{background:var(--bg);border:1px solid var(--line);border-radius:4px;height:14px;overflow:hidden;margin:.25rem 0}
+.bar i{display:block;height:100%;background:var(--acc);width:0;transition:width .5s}
+.bar.warm i{background:var(--warm)}
+.slot{padding:.4rem 0;border-top:1px solid var(--line)}
+.slot:first-child{border-top:0}
+.slot .lbl{display:flex;justify-content:space-between;font-size:.85rem}
+.slot .lbl .st{color:var(--dim)}
+.slot .st.decode{color:var(--ok)}
+.slot .st.prefill{color:var(--acc)}
+.note{color:var(--warm);font-size:.85rem;margin-top:.4rem}
+.ev{color:var(--dim);font-size:.85rem;margin-top:.4rem}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.75rem;overflow-x:auto;font-size:.82rem;margin:.5rem 0}
+footer{color:var(--dim);font-size:.8rem;margin-top:1.5rem}
+noscript p{color:var(--dim)}
+</style>
+</head>
+<body>
+<h1>ds4 console<small>accretion v0</small></h1>
+<section id="status">
+<h2>Status</h2>
+
+<div class="kv"><span>model</span><b>DeepSeek V4 Flash 0731</b></div><div class="kv"><span>quantization</span><b>routed_experts mxfp4 &middot; attention q8_0+f16+f32 &middot; embeddings f16+f32 &middot; shared_experts q8_0 &middot; router f16+f32 &middot; other f16+i32+f32</b></div><div class="kv ctx"><span>context</span><b>131072 configured / 65536 trained</b></div><div id="status-extra"></div>
+</section>
+<section id="activity">
+<h2>Activity</h2>
+<noscript><p>Enable JavaScript for the live activity view. The STATUS and CONNECT sections work without it.</p></noscript>
+<div id="slots"></div>
+<div id="cache"></div>
+<div id="events" class="ev"></div>
+</section>
+<section id="connect">
+<h2>Connect</h2>
+<p>claude CLI:</p>
+<pre id="cc">ANTHROPIC_BASE_URL=http://&lt;host&gt;:8000 \
+ANTHROPIC_MODEL=deepseek-v4-flash \
+ANTHROPIC_SMALL_FAST_MODEL=deepseek-v4-flash \
+claude</pre>
+<p>OpenAI-compatible clients:</p>
+<pre id="oc">base_url = "http://&lt;host&gt;:8000/v1"
+model    = "deepseek-v4-flash"</pre>
+</section>
+<footer>Read-only console. Settings and the prepare-pipeline UX arrive in v1.</footer>
+<script>
+(function(){
+"use strict";
+var host = window.location.host || "<host>:8000";
+function fill(id){var e=document.getElementById(id);e.textContent=e.textContent.replace(/<host>:8000/g,host);}
+fill("cc");fill("oc");
+function gb(n){return (n/1073741824).toFixed(2)+" GiB";}
+fetch("/v1/capabilities").then(function(r){return r.json();}).then(function(c){
+  var x=document.getElementById("status-extra"),h="";
+  if(c.throughput){h+='<div class="kv"><span>throughput ref</span><b>'+
+    Object.keys(c.throughput).map(function(k){return k+": "+c.throughput[k];}).join(" &middot; ")+"</b></div>";}
+  var ec=c.serving&&c.serving.expert_cache;
+  if(ec&&ec.budget_bytes){h+='<div class="kv"><span>expert cache</span><b>'+gb(ec.budget_bytes)+" budget</b></div>";}
+  x.innerHTML=h;
+}).catch(function(){});
+var lastRestores=-1;
+function poll(){
+  fetch("/v1/activity").then(function(r){return r.json();}).then(function(a){
+    var h="";
+    a.slots.forEach(function(s){
+      h+='<div class="slot"><div class="lbl"><span>slot '+s.id+'</span><span class="st '+s.state+'">';
+      if(s.state==="prefill"&&s.prefill){
+        var p=s.prefill,pct=p.tokens_total>0?100*p.tokens_done/p.tokens_total:0;
+        h+="prefill "+p.tokens_done+"/"+p.tokens_total+" &middot; "+p.tokens_per_second.toFixed(1)+" t/s";
+        if(p.eta_seconds!==undefined){h+=" &middot; ETA "+p.eta_seconds.toFixed(0)+"s";}
+        h+='</span></div><div class="bar"><i style="width:'+pct.toFixed(1)+'%"></i></div>';
+      }else if(s.state==="decode"){
+        h+="decoding &middot; "+s.generated_tokens+" tokens</span></div>";
+      }else{h+="idle</span></div>";}
+      h+="</div>";
+    });
+    document.getElementById("slots").innerHTML=h;
+    var ec=a.expert_cache,ch="";
+    if(ec&&ec.budget_bytes&&ec.counted_bytes!==undefined){
+      var w=100*ec.counted_bytes/ec.budget_bytes;
+      ch='<div class="lbl kv"><span>expert cache warmth</span><b>'+gb(ec.counted_bytes)+" / "+gb(ec.budget_bytes)+
+         " ("+w.toFixed(0)+"%, "+ec.entries+' entries)</b></div><div class="bar warm"><i style="width:'+
+         Math.min(w,100).toFixed(1)+'%"></i></div>';
+      if(w<90){ch+='<div class="note">first sessions are slower until the cache warms</div>';}
+    }
+    document.getElementById("cache").innerHTML=ch;
+    var kv=a.kv_events,eh="";
+    if(kv){
+      eh="anchors stored "+kv.stores+" &middot; restored "+kv.restores+" (this uptime)";
+      if(lastRestores>=0&&kv.restores>lastRestores&&kv.last_restore_tokens>0){
+        eh+="<br>restored "+kv.last_restore_tokens+" tokens in "+kv.last_restore_ms.toFixed(0)+" ms";
+      }
+      lastRestores=kv.restores;
+    }
+    document.getElementById("events").innerHTML=eh;
+  }).catch(function(){});
+}
+poll();setInterval(poll,2500);
+})();
+</script>
+</body>
+</html>
+

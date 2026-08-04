@@ -1,0 +1,27 @@
+{
+    "schema_version": 1,
+    "note": "lock-free snapshot; values may be slightly stale",
+    "slots": [
+        {
+            "id": 0,
+            "state": "idle"
+        },
+        {
+            "id": 1,
+            "state": "idle"
+        }
+    ],
+    "expert_cache": {
+        "budget_bytes": 68303978496,
+        "live_budget_bytes": 68303978496,
+        "counted_bytes": 68303978496,
+        "entries": 5109
+    },
+    "kv_events": {
+        "stores": 3,
+        "restores": 1,
+        "restored_tokens_total": 24068,
+        "last_restore_tokens": 24068,
+        "last_restore_ms": 118079.3
+    }
+}
