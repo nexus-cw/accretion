@@ -3555,3 +3555,883 @@ silently fall back to buffered reads?
 
 **Server state:** verification used strace attach on the live service (no stop);
 `curl localhost:8000/v1/models` = 200 after detach.
+
+## Task #16 — system-prompt KV pinning + fresh-session prefix restore (2026-08-03)
+
+**Finding first: design items (a) and (c) already exist upstream and work.**
+The #11 audit claim ("a NEW session does not consult the disk store") is stale.
+Verified in code and on the wire:
+- Restore-before-prefill: `generate_job` (ds4_server.c:11081) calls
+  `kv_cache_try_load` on every request whose live-cache probes miss (cached==0);
+  `ds4_kvstore_find_text_prefix` (ds4_kvstore.c:1190) picks the longest stored
+  byte-prefix by SHA1 and restores it before prefill. Cold checkpoints are
+  anchored at the chat task boundary (`ds4_kvstore_chat_anchor_pos`, last user
+  marker before first assistant, commit f074c7b) — exactly the shared
+  system-prompt + tool-schema prefix.
+- Slot affinity: `job_slot_score` (ds4_server.c:12070) already routes each job
+  to the idle slot with the longest live common token prefix; explicit live
+  tool-state bindings force their slot. Nothing to add at --batched-session 2.
+- What was actually missing: (b) a pinning policy protecting hot anchor
+  checkpoints from budget eviction. Implemented, commit e83d95d (see
+  KV_PINNING.md).
+
+**Protocol.** claude CLI from croft, fresh session each time (no --continue),
+ANTHROPIC_BASE_URL=http://100.92.111.3:8000, empty --strict-mcp-config, trivial
+one-word prompts. ~25.2k-token first request (system + tool schemas + CLAUDE.md
+reminder + prompt).
+
+| run | conditions | result |
+|---|---|---|
+| session 1 (baseline, no matching prefix stored) | fresh; store had only foreign-config prefixes | full prefill 25242 tok @ ~28.3 t/s avg = **990.7 s**; CLI timeout+retry doubled the pain; wall ~15-16.5 min |
+| cold anchor store (end of session 1) | — | tokens=24136 trimmed=1106 reason=cold, 339.78 MiB, save=336 ms |
+| session 2 (fresh, different prompt) | server still busy with session-1 retry | hit: restored 24136 tok in **1059 ms**, tail 1106 tok prefill 136 s; wall 539 s (queueing + duplicate request contamination) |
+| **service restart** then session 3 (fresh, different prompt) | idle server, store reloaded from disk after `systemctl restart` | hit: restored 24136 tok in **211 ms**, tail 1107 tok in 132.9 s @ 8.3 t/s; **total wall 144 s**, rc=0, correct output |
+
+**Acceptance vs target.** First-token wall clock dropped ~16.5 min → ~140 s
+(7x). The <60 s target was NOT met: the restore itself is negligible
+(211-1059 ms for a 24k-token / 340 MiB checkpoint), and all remaining time is
+the ~1.1k-token tail prefill (the per-session CLAUDE.md system-reminder + user
+message that lives after the anchor) running at ~8 t/s. Small-tail prefill is
+throughput-bound by per-chunk expert streaming, not by KV restore. Getting
+under 60 s needs faster short-prefill (task #14/#22 territory), not more KV
+machinery.
+
+**Journal evidence (session 3).**
+```
+14:17:50 kv cache hit text tokens=24136 text=100545 quant=2 key=token-text load=211.0 ms file=.../e69ada33....kv
+14:17:50 chat ctx=24136..25243:1107 TOOLS prompt start
+14:20:03 chat ctx=24136..25243:1107 TOOLS prompt done 132.850s
+```
+
+**Regressions checked.**
+- No-stored-prefix request: unchanged path (session 1 behaved exactly as
+  baseline; miss log + full prefill + anchored cold store).
+- OpenAI path: /v1/chat/completions smoke 200 with sane usage accounting.
+- Env unset: pinning defaults off; `ds4_server_test` suite passes incl. new
+  `test_kv_cache_pinning_predicate`; CPU build clean on croft.
+- Restart persistence: store survives `systemctl restart` (on-disk, rescanned
+  at open; shutdown checkpoints of live slots are also written). Session 3's
+  hit was served by the post-restart process.
+
+**Memory discipline (128 GB box, ~15 GB margin).** MemAvailable sampled every
+10 s through session 3: 113 GB right after restart, settling to 15.9-16.4 GB as
+the 75 GB expert LRU re-warmed; never below 15.8 GB during restore or tail
+prefill. The restore path adds no resident footprint beyond the slot's arena.
+
+**Store pressure note.** /home/jacinta/.ds4/kv is at 3.7 GiB of the 4096 MiB
+budget with 12 entries; budget eviction will start choosing victims soon.
+That is exactly the scenario DS4_KV_PIN_MIN_HITS exists for; enabling it in
+production (e.g. =2) plus a larger --kv-disk-space-mb is the operator's call.
+
+
+## expert-cache budget 75 vs 70 (2026-08-03)
+
+A/B of `--ssd-streaming-cache-experts 75GB` (production) vs `70GB` on robo-dog,
+motivation: free ~5GB RAM for future multi-session work if the throughput cost
+matches the locality_sim prediction. **Prediction** (locality_sim sweep over
+captured traces, 2026-08-03): 70GB ~= 93.9% decode hit vs 94.9% at 75GB, ~-3.9%
+throughput, ~5.65 t/s vs a 5.88 batched-server effective baseline. **Decision
+rule** (operator-ratified): promote 70GB if its warm steady-state >= 5.5 t/s,
+else revert to 75GB.
+
+**Protocol.** Exact fadvise-A/B methodology (the most recent comparable): server
+STOPPED, manual `./ds4` REPL, `research/gb10/session_prompts.txt` (8-turn
+long-session), `-n 350 --cuda --ssd-streaming --nothink`, model
+`gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf`, `DS4_CUDA_STREAM_STATS=1`
+(still not wired into the REPL path, no direct hit counter -- same finding as
+prior long-session units). Page cache dropped (`echo 3 > drop_caches`) before
+every arm for arm-equality. Budget lines confirmed each arm: 75GB = 68.62 GiB
+dynamic cache / 5511 experts; 70GB = 63.61 GiB / 5109 experts (delta 5.01 GiB /
+402 experts). Warm steady = mean of turns 6-8. Memory = per-2s background
+MemAvailable sampler, MINIMUM (in-flight steady footprint); post-run free is
+useless (process already exited). Ran 2 reps of the 70GB arm (decision was near
+the boundary).
+
+| arm | budget | cold t1 | t2 | t3 | t4 | t5 | t6 | t7 | t8 | steady 6-8 | 2-8 mean | in-flight min MemAvail (GiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 75GB    | 75GB | 4.94 | 5.98 | 5.64 | 5.61 | 5.20 | 5.51 | 5.25 | 5.51 | **5.42** | 5.53 | 18.62 |
+| 70GB r1 | 70GB | 5.05 | 5.63 | 5.41 | 5.44 | 5.39 | 5.11 | 5.35 | 5.47 | **5.31** | 5.40 | 24.03 |
+| 70GB r2 | 70GB | 4.99 | 5.51 | 5.49 | 5.51 | 5.36 | 5.07 | 5.49 | 5.59 | **5.38** | 5.43 | 23.98 |
+
+70GB warm-steady mean over the two reps = **5.35 t/s**. Cold prefill was
+0.58-0.72 t/s across all arms (indistinguishable).
+
+**Memory freed:** in-flight MemAvailable rose from 18.62 GiB (75GB) to ~24.0 GiB
+(70GB, both reps) = **~5.4 GiB freed**, matching the ~5GB prediction and the
+5.01 GiB dynamic-cache-budget delta.
+
+**Throughput cost:** 70GB (5.35) vs 75GB (5.42) in the SAME protocol = **-1.4%**,
+SMALLER than the predicted -3.9%. Popularity skew held: dropping 402 experts
+(5.01 GiB) cost almost nothing because those marginal GBs hold rarely-selected
+experts.
+
+**Decision: REVERT to 75GB (rule-faithful).** Both 70GB reps (5.31, 5.38; mean
+5.35) fall BELOW the operator-ratified 5.5 t/s gate. Note, however, that the
+**75GB control arm also measured 5.42 < 5.5 under this single-session manual-REPL
+protocol** -- the 5.5 threshold was anchored to the 5.88 t/s *batched-server
+effective-decode* figure, a different methodology that runs ~0.4-0.5 t/s hotter
+than a single-session REPL (consistent with the fadvise unit's 5.55-5.60 at
+75GB). So the absolute gate is effectively unreachable in the comparable
+protocol, and the *relative* cost of 70GB (-1.4%) beat prediction while freeing
+the predicted ~5.4 GiB. Reverting is the conservative, rule-literal action and
+leaves the promote decision with the operator, who may wish to re-ratify the
+gate against the manual-REPL methodology (a relative gate, or an absolute ~5.3,
+would flip this to PROMOTE). Service file UNCHANGED (still 75GB); production
+restarted and verified (`systemctl is-active`=active, `GET /v1/models`=200, chat
+smoke OK).
+
+### Gate re-ratification (operator, 2026-08-03)
+
+The original promote gate (steady >= 5.5 t/s) was anchored to the 5.88 t/s
+batched-server figure -- a hotter methodology than the manual-REPL protocol the
+A/B actually uses, making the absolute number unreachable by either arm (the
+75GB control itself measured 5.42). Re-ratified gate for cache-budget decisions:
+RELATIVE, same-protocol -- promote a smaller budget when the warm-steady cost is
+<= 3 percent per ~5 GiB freed under the manual-REPL protocol, with an absolute
+floor of 5.2 t/s warm-steady. The 70GB result (-1.4 percent, 5.35 t/s, 5.4 GiB
+freed) passes; 70GB PROMOTED to production 2026-08-03 (authority commit ae73291).
+
+## Task 18: expert-cache budget under-accounting -- audit, byte-enforcement fix, self-report (2026-08-03)
+
+**Bug evidence reconciled.** Two divergences, one accounting gap:
+
+- The "63.61 GiB / 5109 experts" figure at the 70GB setting is the boot-time
+  PLAN line (`ds4.c:55179`), not a measurement: 70 GiB = 6.38 GiB prefill
+  headroom + 63.61 GiB dynamic cache. It sits below nominal by construction
+  (headroom subtracted), so it was never evidence the cache fits.
+- The 2026-08-02 GA-thrash incident (100GB setting -> ~121GB observed) is the
+  count-only enforcement overshooting: the byte budget is converted to an
+  expert COUNT using the dominant slab size class
+  (`ds4.c:5328 ds4_streaming_cache_experts_for_byte_budget`, class chosen at
+  `ds4.c:5208`), but the CUDA LRU (`ds4_cuda.cu`, commit 416533c) deliberately
+  caches EVERY routed layer at its actual per-expert size -- including
+  off-slab-class ("boosted"/bypass) layers with larger quants -- while the
+  eviction loop (`cuda_stream_expert_cache_prune_global`) compared only
+  `entry_count > budget_experts`. N larger-than-class entries = more bytes
+  than N * class_bytes. On top of that, the P3b pool (ac01189) parked freed
+  device buffers on per-size free lists with no accounting at all, and
+  system-level subtraction also swept in non-cache categories (pinned-host
+  staging pools, KV arenas) that were never part of the cache budget.
+
+**AUDIT table (byte sources in the CUDA streaming-cache path, 70GB setting):**
+
+| source | file:line (research/gb10 654840c) | counted before | actual | disposition |
+|---|---|---|---|---|
+| LRU entry device buffers (gate/up/down per (layer,expert)) | ds4_cuda.cu `cuda_stream_expert_cache_install` | entry COUNT only (vs count budget) | sum of actual per-entry bytes; off-class layers > slab class | now charged at actual bytes vs byte budget |
+| P3b pool free lists (parked evicted buffers) | ds4_cuda.cu `cuda_stream_expert_pool_free/alloc` | not counted | real cudaMalloc'd device memory | now counted as `pool_parked`, inside budget |
+| cudaMalloc granularity/alignment per buffer | driver | not counted | <=512B per multi-MiB buffer, negligible (<0.01%) | documented, not charged |
+| host-side entry metadata table | ds4_cuda.cu `g_cuda_expert_cache` (80x384 entries) | not counted | ~3 MiB host RAM, static | documented, not charged |
+| pinned staging: model upload pool (4x), selected-expert pool (4x), xdev bounce | ds4_cuda.cu `g_model_stage_raw` / `g_stream_selected_stage_raw` / `g_xdev_bounce` | not counted anywhere | 0.500 GiB measured at 70GB | separate category, reported as `pinned_host` |
+| same-call packed staging (`g_stream_selected_cache`) | ds4_cuda.cu | not counted | bounded by per-call selected set | transient working buffer, not cache budget |
+| prefill headroom / full-layer prefix / KV arenas | ds4.c budget plan / kvstore | planned separately | separate | correctly outside "dynamic cache"; belongs to the 70GB total plan, not the LRU |
+
+**FIX (commits 64c7dd7 + 654840c, research/gb10):** valid entries are charged
+at actual gate+up+down bytes; pool free-list bytes are counted as parked; the
+nominal byte budget is `budget_experts * slab_bytes` (exactly the planned
+"dynamic cache" GiB); installs make room BEFORE allocating, trimming parked
+pool buffers first, then evicting LRU, so `counted + parked <= budget` at all
+times. Parked bytes up to the incoming request are treated as reusable slack --
+the first cut double-counted them and reintroduced the P3b malloc/free churn
+at cap (measured ~3.7 t/s manual-protocol vs 4.5 expected; 654840c fixes it).
+The count cap remains as a secondary bound.
+
+**OBSERVABILITY:** `DS4_CUDA_STREAM_STATS=1` now self-reports every 4096 fetch
+calls (~90 decode tokens):
+`ds4: CUDA streaming expert-cache memory: budget=63.613 GiB counted=63.613 GiB
+pool_parked=0.000 GiB device_total=63.613 GiB pinned_host=0.500 GiB entries=5109`
+
+**VERIFY at 70GB (manual instance, robo-dog, this model MXFP4-uniform):**
+device_total held exactly at budget (63.613 GiB) across all samples, entries
+pinned at 5109, hit rate 0.86 -> 0.92 warming, MemAvailable steady ~34-36 GB.
+Warm turns 4.39-4.54 t/s END-TO-END (elapsed incl. prefill); back-computed
+decode-only ~5.35 t/s (128 tok: 23.9s decode at 5.35 + ~4.5s prefill = 28.4s
+observed) -- consistent with the A/B baseline, no regression. Note the uniform
+model exercises the accounting but not the off-class overshoot itself; a mixed
+quant (the incident's config) is where actual would previously exceed nominal.
+
+**PR #647 (cuda-expert-lru) assessment:** the branch carries the same
+count-only enforcement and unaccounted pool -- the bug exists upstream. A
+cherry-pick of 64c7dd7 does NOT apply cleanly (conflicts in the stats block
+and the pinned-host reporting, which references gb10-only staging globals);
+a small manual backport is needed. Not pushed upstream per task scope.
+
+Production restored after measurement: service active, `/v1/models` 200, chat
+smoke OK, 70GB budget unchanged.
+
+## Task 12 -- concurrent-session scheduling (prefill interleave + batched decode)
+
+**Commit:** 33e2b3d (`DS4_SCHED_BATCH_DECODE` kill switch). Audit finding first:
+the "server fully serializes requests" claim had drifted -- at ecebda5 batched
+mode (`--batched-session N`) already round-robins prefill quanta across slots
+with decode priority (`server_session_sync` / `server_prefill_enter`,
+ds4_server.c) and coalesces concurrent decodes into one model pass
+(`decode_worker_main` -> `ds4_sessions_eval_batch`; the CUDA path encodes each
+session's exact one-token kernels in a single command submission, so greedy
+identity holds by construction). Task 12 added only the missing A/B kill
+switch and then measured.
+
+**Protocol:** robo-dog, manual instance (service stopped), production model +
+flags but `--batched-session 3`, temp-0 chat completions, 3 distinct ~60-token
+agent-style prompts, 512 completion tokens per session, expert cache warmed
+before each measured leg (fresh process per config). Driver: 3 concurrent
+OpenAI clients. `DS4_SERVER_BATCH_LOG=1` for batch-size histograms.
+
+| leg | config | per-session wall (s) | agg wall (s) | agg tok/hr |
+|---|---|---|---|---|
+| a | solo (batched-session 3, 1 client), per-prompt | 139.1 / 140.2 / 143.1 | 139-143 | 13,145-13,478 |
+| b | serialized 3-way (no --batched-session) | 140.4 / 284.3 / 423.3 | 423.3 | 13,062 |
+| c | interleave only (bs=3, DS4_SCHED_BATCH_DECODE=0) | 290.8 / 341.8 / 431.8 | 431.8 | 12,806 |
+| d | interleave + batched decode (bs=3) | 436.6 / 437.3 / 437.8 | 437.8 | 12,631 |
+
+Batch histogram for leg d: 507 batches of 3, 5 of 2 (i.e. decode batching
+engaged for essentially every step). Greedy identity: all 3 sessions'
+temp-0 outputs byte-identical solo vs batched-3. KV: 3x32k sessions fit
+(self-report: KV 0.78 GiB total in the 72 GiB plan); no slot eviction fights.
+MemAvailable min across all 3-way legs: 20.6 GiB (abort threshold 8 GiB never
+approached).
+
+**VERDICT vs the 2x bar: NOT MET.** Aggregate tokens/hour is flat (~12.6-13.1k)
+across serialized, interleaved, and batched-decode configs -- within noise of
+solo (~13.2k). The GB10 is decode-throughput-saturated: the batched CUDA path
+runs each session's own one-token kernels back-to-back in one submission
+(correct, identity-preserving) but shares no weight reads between sessions, so
+a batch-3 step costs ~3.16x a solo step (0.855 s vs 0.271 s). The
+shared-expert-fetch physics hypothesis does not pay at ~94% warm hit because
+decode time is dominated by expert GEMV compute/bandwidth on cached weights,
+not by residual SSD fetches. Honest concurrent capacity: 3 sessions run
+concurrently with per-session wall ~= 3.1x solo (fair, simultaneous progress,
+byte-identical outputs) -- aggregate ~1.0x. Per-session bar (<=1.5x solo) is
+likewise not met by any config.
+
+**What 2x would actually need:** fused multi-sequence kernels -- batched
+expert GEMV that processes all sessions' tokens per (layer,expert) in one
+kernel with per-sequence KV, deduplicating weight reads across the batch
+(the a627e80 grouped-prefill trick applied to decode). That is a kernel-level
+unit, deferred. Mixed prefill+decode batches
+(`ds4_sessions_eval_batch_with_prefill`) exist in the library but are not
+wired into the server -- also deferred; interleaving already bounds prefill
+stalls to one 128-token quantum.
+
+### Cross-session router-overlap probe (2026-08-04, task #25 go/no-go)
+
+Method: aligned decode steps from the three routing traces treated as three
+concurrent sessions; per (step, layer), compare summed per-session expert
+selections vs the distinct union — the weight-read saving a fused
+multi-sequence decode kernel could capture.
+
+Result: batch-3 dedup saving 5.3 percent; batch-2 pairs 2.3-3.4 percent.
+Chance-level pairwise collision at k~6 of 256 is ~2.3 percent, so
+cross-session overlap is chance plus a sliver of popularity skew. Verdict:
+fused multi-sequence decode is a NO-GO (~5 percent ceiling vs the 2x bar);
+the task-12 flat aggregate is architectural. Remaining aggregate levers:
+per-stream speculative decode (post-658) or additional hardware.
+
+## Task 10: honest capability endpoint -- GET /v1/capabilities (2026-08-03)
+
+**Commits:** 26490ec + 294cc41 (research/gb10). Endpoint mounted at
+`/v1/capabilities` and `/capabilities` (plain GET, JSON, standard-client
+readable). Static facts are snapshotted once at startup
+(`ds4_engine_capabilities()`, ds4.c) from the loaded GGUF metadata and the
+POST-LOAD tensor table (i.e. quantization actually served, including load-time
+dense dequant); dynamic figures are O(1) counter reads (task-18 expert-cache
+byte accounting, exported from ds4_cuda.cu). No GPU work per request; safe to
+poll. CPU/Metal/ROCm builds serve the endpoint without the CUDA-only counters.
+
+The honest-context centerpiece, live from robo-dog: the GGUF declares
+`context_length=1048576` (RoPE-stretched, factor 16) but
+`rope.scaling.original_context_length=65536` -- the endpoint reports
+`configured=32768`, `trained=65536`, with both raw metadata values under
+`rope`. Throughput is NOT reported unless the operator supplies measured
+numbers via `DS4_CAPS_THROUGHPUT_JSON` (a JSON object passed through
+verbatim); the server never benchmarks at request time and never fabricates
+a figure.
+
+Live sample (robo-dog production, cache warming; abbreviated quantization):
+
+```json
+{"schema_version": 1,
+ "model": {"name": "DeepSeek V4 Flash 0731", "architecture": "deepseek4",
+   "parameters": 284334567511, "file_bytes": 156378344992,
+   "quantization": [
+     {"category": "routed_experts", "quants": "mxfp4", "tensors": 129, "bytes": 147169738752},
+     {"category": "attention", "quants": "q8_0+f16+f32", "tensors": 806, "bytes": 5730582308},
+     {"category": "embeddings", "quants": "f16+f32", "tensors": 6, "bytes": 2118270996},
+     {"category": "shared_experts", "quants": "q8_0", "tensors": 129, "bytes": 1149763584},
+     {"category": "router", "quants": "f16+f32", "tensors": 83, "bytes": 90218496},
+     {"category": "other", "quants": "f16+i32+f32", "tensors": 175, "bytes": 43833892}]},
+ "context": {"configured": 32768, "trained": 65536,
+   "rope": {"original_context_length": 65536, "declared_context_length": 1048576,
+            "scaling_factor": 16, "freq_base": 10000}},
+ "serving": {"ssd_streaming": true, "ssd_streaming_cold": false,
+   "batched_mode": true, "batched_sessions": 2,
+   "session_context_buffer_bytes_estimated": 1104933888,
+   "expert_cache": {"budget_bytes": 68303978496, "live_budget_bytes": 68303978496,
+     "counted_bytes": 37474271232, "pool_parked_bytes": 0,
+     "device_total_bytes": 37474271232, "entries": 2803, "configured_experts": 5109},
+   "kv_disk_store": {"enabled": true, "budget_bytes": 17179869184,
+     "pinning": true, "pin_min_hits": 2, "entries": 15}},
+ "apis": {"openai_chat_completions": true, "openai_completions": true,
+   "openai_responses": true, "anthropic_messages": true, "count_tokens": false,
+   "sse_streaming": true,
+   "speculative": {"mtp": false, "mtp_active": false, "mtp_draft_tokens": 1, "dspark": false}}}
+```
+
+Verified: `/v1/models` 200, chat smoke OK, service ACTIVE; budget 63.613 GiB
+matches the task-18 self-report plan for the 70GB setting; counted bytes climb
+toward budget as the cache warms (entries 2803 -> cap 5109).
+
+## ctx 65536 headroom validation + promotion (2026-08-03)
+
+Task: validate --ctx 65536 (the model's TRAINED original_context_length --
+the GGUF-declared 1048576 is a 16x RoPE stretch) with the headroom freed by
+the 70GB cache promotion, and promote if it passes. Binary at 2fd0994.
+
+Protocol: production stopped; manual instance from the same binary with the
+identical production flag set except --ctx 65536 (DS4_KV_PIN_MIN_HITS=2 kept).
+A driver built one honest deep session over 8 chat turns (~6k-token chunks of
+real repo text appended each turn) to ~45k tokens, then a second concurrent
+session ran a normal exchange while the deep session took a final turn.
+MemAvailable/SwapFree sampled every 5s throughout.
+
+### Boot plan at ctx 65536 (delta vs 32768)
+
+- Cache split UNCHANGED: 70.00 GiB = 6.38 GiB prefill headroom + 63.61 GiB
+  dynamic cache (5109 experts, 12.75 MiB each). Prefill headroom does not
+  scale with ctx.
+- Per-slot context buffers 1739.75 MiB (raw_kv_rows=4352,
+  compressed_kv_rows=16386, prefill_chunk=4096) vs ~1053 MiB at 32768;
+  capabilities self-report session_context_buffer_bytes_estimated
+  1824257024 (was 1104933888). Total plan 72.67 GiB.
+- /v1/capabilities: configured=65536, trained=65536.
+
+### Memory curve (MemAvailable)
+
+| point                                   | MemAvailable |
+|-----------------------------------------|--------------|
+| after model load, cache empty           | 106.3 GiB    |
+| mid-run, cache warming, ~22k ctx        | 19.1 GiB     |
+| deep turns 4-8 (28k-45k ctx) steady     | ~19.1 GiB    |
+| dual-slot combined peak (45k + slot 2)  | 19.8 GiB     |
+| minimum over whole run (5s sampler)     | 18.6 GiB     |
+
+Swap: SwapFree dipped from 15.7 to 13.5 GiB (~2.2 GiB paged out, cold pages
+making room for the expert cache) and plateaued -- no thrash, MemAvailable
+flat throughout. Floor criterion was 8 GiB; never approached.
+
+### Throughput at depth
+
+- Warm shallow decode: avg 5.36 t/s (baseline 5.35 -- parity).
+- Decode at 41k ctx: 4.37-5.04 t/s; at 45k ctx single slot: 4.78 t/s
+  (-10.7% vs baseline, inside the 15% band).
+- Dual-slot concurrent decode: ~2.4 t/s per slot (~4.8 aggregate) -- batch
+  decode splits fairly, no starvation, both slots functional at depth.
+- Prefill of small continuation chunks at depth is slow (1.5-8 t/s observed)
+  and two turns re-prefilled ~24k after checkpoint-match fell back to a
+  shorter prefix (838s, 1174s walls) -- a latency note, not a memory issue.
+
+### KV disk at 65536
+
+Deep-session anchors on disk: 560-590 MB each (~570 MB per ~45-50k
+checkpoint, matching the ~9 MB/1k-token estimate). The 16384 MiB budget
+holds ~27 such anchors; kv dir stood at 6.9 GiB after the run. Checkpoints
+stored and restored across turns (thinking live checkpoint remembered /
+continuation match lines in the server log).
+
+### Verdict: PASS -- promoted
+
+No OOM, no thrash, no server errors, clean shutdown. Production
+/etc/systemd/system/ds4-server.service patched --ctx 32768 -> 65536 with the
+prudence-deviation comment replaced by the validation record; daemon-reload +
+restart verified (/v1/models 200, capabilities configured=65536, chat smoke).
+Authority copy committed on dMon /opt/carriedworld-cloud (064d3ad, unpushed).
+
+## 2026-08-04 — ctx 131072 / 262144 validation (RoPE-stretch, quality-gated); 131072 PROMOTED
+
+Unit: validate --ctx 131072 (2x trained) and --ctx 262144 (4x trained) on
+robo-dog, memory AND quality at depth; promote the largest passing config.
+trained original_context_length=65536 (/v1/capabilities), GGUF-declared
+1048576 = 16x stretch. Test pattern: production stopped, manual instance,
+production flags except --ctx. 256k arm ABORTED BY OPERATOR mid-run (below).
+
+### Boot plans (measured)
+
+| ctx | context buffers / slot | 2 slots | planned total | caps configured/trained |
+|---|---|---|---|---|
+| 65536 (prior) | 1739.75 MiB | ~3.4 GiB | 74.0 GiB-class | 65536 / 65536 |
+| 131072 | 3111.75 MiB | >= 6.08 GiB | 74.01 GiB | 131072 / 65536 |
+| 262144 | 5855.75 MiB | >= 11.44 GiB | 76.69 GiB | 262144 / 65536 |
+
+Per-slot buffers scale ~1.79x per ctx doubling (not the naive 2x: raw ring
+fixed at 4352 rows, compressed rows scale: 32770 @128k, 65538 @256k).
+Prefill headroom (6.38 GiB) and expert cache (63.61 GiB) unchanged, as
+predicted by the 65k unit.
+
+### SERVING FINDING (load-bearing for all deep-context use): every request
+re-prefills the full prompt on this build (HEAD 24c8261)
+
+- Live-slot KV reuse fails on EVERY conversation continuation with
+  reason=token-mismatch at the turn boundary (observed: common=6102 vs
+  live=6119; common=107755 vs live=107929). The generated (thinking) token
+  history retokenizes differently on replay, so the memory-token,
+  memory-text, and thinking-visible paths all miss. Confirmed on BOTH
+  /v1/chat/completions and /v1/messages (anthropic).
+- Disk kv anchors: only small "cold" anchors (~3.5k tokens, trimmed to the
+  raw-window boundary) were ever HIT. Deep "continued"/"evict" anchors
+  (10240..102400 tokens, up to 1440 MiB) were stored but never matched by
+  ds4_kvstore_find_text_prefix on identical re-sent prompts — every deep
+  request prefilled from ctx=0. Root cause not fully isolated (sha-prefix
+  lookup looks correct in ds4_kvstore.c; suspect interaction in the
+  find/eviction path). Without pinning, mid-doc anchors are also evicted
+  (disk-cache-full, hits=0) under the 16384 MiB budget.
+- Net: a 101k-token prompt costs ~57 min prefill EVERY time (~29.5 t/s).
+  Two concurrent deep prefills collapse to ~2.1 t/s each (observed) — the
+  scheduler interleaves 128-token chunks and NVMe streaming (~4 GB/s, ~69%
+  util) is the shared bottleneck. A shallow request issued during a deep
+  prefill was starved ~44 min before completing.
+- Consequence for protocol: needle probes could not be separate cheap turns
+  (each = full re-prefill); the quality gate was run as a single deep
+  request with all probes asked at once (deviation, operator-visible), plus
+  a mid-depth request. Also: model burns most of a small max_tokens budget
+  on thinking — first probe run at max_tokens=700 spent ~670 tokens thinking
+  and truncated; rerun at max_tokens=2500 with a "answer directly" system
+  line completed.
+
+### ctx=131072 — memory
+
+| point | MemAvailable | notes |
+|---|---|---|
+| post-boot (cache cold) | 109.1 GiB | before expert cache fills |
+| warm steady, deep prefill running | ~17.1-18.2 GiB | stable through 101k prefill |
+| minimum over whole arm | 16.51 GiB | floor criterion 8 GiB — wide margin |
+| swap | peak ~1.2 GiB used | no thrash; SwapFree 16.46 -> 15.27 GiB min |
+
+Dual-slot at depth: shallow request fired during the 101k prefill/decode
+completed (elapsed 2675 s — starvation latency, see finding above); memory
+held (the min above includes this window). No OOM, no server errors.
+
+### ctx=131072 — quality gate (needle-in-haystack, self-scored, verbatim)
+
+Document: ~365 KB real repo text, 101,021-101,031 prompt tokens, 7 invented
+factoids planted at controlled depths. temperature=0.
+
+Mid-depth request (56,044 tokens, inside trained window), answers verbatim
+"1. QRX-2214\n2. BLUE-HERON-52\n3. TN-88413-F" — 3/3 exact.
+
+Full-depth request (101,031 tokens; stretch zone = beyond 65536):
+
+| # | planted depth (tok) | key | expected | answer | pass |
+|---|---|---|---|---|---|
+| 1 | ~5k | pump station Delta-7 maintenance code | QRX-2214 | QRX-2214 | PASS |
+| 2 | ~30k | reservoir gate Kilo-3 access phrase | BLUE-HERON-52 | BLUE-HERON-52 | PASS |
+| 3 | ~45k | turbine Echo-9 serial | TN-88413-F | TN-88413-F | PASS |
+| 4 | ~60k | depot Sierra-1 callsign | FOXTROT-NINER-2 | FOXTROT-NINER-2 | PASS |
+| 5 | ~80k (stretch) | manifold Tango-4 valve torque | 112 newton-metres | 112 newton-metres | PASS |
+| 6 | ~90k (stretch) | sensor array Lima-6 firmware tag | v7.3.1-rc4 | v7.3.1-rc4 | PASS |
+| 7 | ~100k (stretch) | culvert November-8 inspection date | 14 March 2031 | 14 March 2031 | PASS |
+
+Recall: 4/4 = 100% inside trained window; 3/3 = 100% stretch zone
+(gate: 100% / >=75%). Reasoning-over-context probes (same request), verbatim:
+
+Q8 "Which IMPORTANT RECORD appears closest to the end of the document and
+which earliest?" -> "Closest to the end: \"the inspection date for culvert
+November-8 is 14 March 2031\" (just before END OF DOCUMENT). Earliest:
+\"the maintenance code for pump station Delta-7 is QRX-2214\" (in the QA
+Before Releases section)." — correct on both, correctly localized.
+
+Q9 beginning/middle/end characterization -> "Near the beginning: project
+documentation (Agent Notes: goals, quality rules, layout, testing). Middle:
+model card synopsis, release QA gates, README/usage documentation, and
+CLI/server source code. End: low-level distributed-inference source code
+(ds4_distributed.c) and the final IMPORTANT RECORD." — accurate against the
+actual corpus ordering. Subjective quality at 101k: coherent, precise, no
+degradation signs. QUALITY: PASS.
+
+### ctx=131072 — throughput at depth
+
+| depth (prompt tokens) | prefill avg t/s | decode t/s |
+|---|---|---|
+| shallow (35) warm | — | 5.36 (65k-unit baseline; this arm's shallow probes were contended: 0.66-1.64, not comparable) |
+| 56,044 | 29.7 | 4.02 |
+| 101,021-107,769 | 23.4-29.6 | 4.20 (uncontended run; 3.29 and 3.13 on concurrent runs) |
+
+Decode -21.6% at 101k vs 5.36 shallow — outside the 15% band used at 65k
+but graceful and interactive; degradation is depth-driven, not
+config-driven (the band was defined for the 45k point; at 45-56k this
+config shows 4.02-4.78, consistent with the 65k unit's own curve).
+
+### KV anchor arithmetic at 131072
+
+Measured ~13.4 MB/1k tokens on-disk (426 MiB @30720, 695 MiB @51200,
+1233 MiB @92160, 1440 MiB @107929 — above the 65k unit's ~9 MB/1k estimate;
+compressed-row mix differs at 128k). 16384 MiB budget holds ~11 full-depth
+(107k) anchors; with pinning off, deep anchors evict small ones
+(disk-cache-full observed). Production keeps DS4_KV_PIN_MIN_HITS=2.
+
+### ctx=262144 — arm ABORTED BY OPERATOR (partial data)
+
+- Boot at bs=2 SUCCEEDS: buffers 5855.75 MiB/slot (11.44 GiB both),
+  planned 76.69 GiB, caps configured=262144/trained=65536. The
+  --batched-session 1 fallback was never needed for boot.
+- Deep build reached 63,488/195,188 tokens (32.5%) at avg 29.13 t/s prefill
+  when the operator stop landed (prefill-acceleration work queued behind
+  this unit; 256k ceiling documentation judged not worth the box-hours).
+- Memory at abort window: MemAvailable min 10.87 GiB (floor 8 GiB — closer
+  but never breached); swap peak ~2.8 GiB used (fail threshold 3 GiB
+  sustained — flirting with it during prefill; would have needed watching
+  at 195k + dual slot).
+- NO quality probes were reached. 262144 is NOT validated: memory-plausible
+  at bs=2 but quality at 4x stretch is unknown. Do not promote without a
+  fresh quality-gated run.
+
+### Verdict and production state
+
+ctx=131072: PASS memory + PASS quality -> PROMOTED 2026-08-04.
+/etc/systemd/system/ds4-server.service ExecStart --ctx 65536 -> 131072
+(assert-exact replace), validation comment block updated; daemon-reload +
+restart; verified /v1/models 200, capabilities configured=131072
+trained=65536 pin_min_hits=2, chat smoke OK. Instant-rollback IQ2 block
+untouched. Authority copy committed on dMon /opt/carriedworld-cloud
+(9981edb, local only, unpushed).
+
+Deviations: (1) quality probes batched into one request per depth instead
+of separate turns (forced by full-re-prefill economics, documented above);
+(2) test instances initially ran without DS4_KV_PIN_MIN_HITS=2 (CLI-flag
+parity only) — corrected at the 128k restart; (3) 65k-unit's per-config
+"dual-slot concurrent decode" measurement replaced by the concurrent
+shallow-during-deep probe (starvation result above) — two concurrent DEEP
+sessions were shown to collapse prefill to ~2.1 t/s each, which is the
+stronger statement.
+
+## Task #30 — KV continuation "full re-prefill" root-caused + fixed (deep canonical prompt anchors); 128k multi-turn-at-depth gap closed (2026-08-04)
+
+Unit: the 128k promotion recorded "every request re-prefills the full prompt"
+(live-KV token-mismatch at every turn boundary; deep disk anchors stored but
+never matched). Isolate the variable, root-cause, fix with the smallest safe
+change, and close the "multi-turn at depth unvalidated" gap the 128k unit
+left open. Fix commit ee2722d on research/gb10; production on robo-dog runs
+the new binary.
+
+### Isolating experiment matrix (small 2-3-turn prompts, production ctx=131072)
+
+| case | API | thinking | turn N+1 result |
+|---|---|---|---|
+| A | /v1/chat/completions | on, finish=stop | HIT `match=visible-prefix`, 9-tok delta prefill |
+| B | /v1/messages (anthropic) | on, finish=stop | HIT `match=visible-prefix`, 9-tok delta prefill |
+| C | chat, thinking TRUNCATED (finish=length) | on | MISS token-mismatch -> full re-prefill next turn |
+| D | deep re-send of identical prompt >30k | either | MISS -> full re-prefill (no matchable anchor) |
+
+Key correction to the 128k finding: multi-turn continuation with normal
+(finish=stop) turns is NOT broken on this build — it already hits the
+`thinking-visible` live checkpoint and prefills only the new-user-turn delta,
+on BOTH chat and anthropic (cases A/B, verified 9-token deltas). The 128k
+"every request re-prefills" observation was dominated by TWO methodology
+artifacts, each an instance of one root cause:
+
+- Truncated probe turns (case C): the quality probes used tiny max_tokens
+  and the model spent the budget inside `<think>`, so turns finished
+  finish=length. `should_remember_thinking_checkpoint()` deliberately (and
+  correctly) skips length-truncated turns — the sampled KV holds an unclosed,
+  thinking-stripped-on-replay span, so no cheap continuation is even
+  well-defined. This is inherent, not a fixable bug.
+- Deep needle probes were re-sent as fresh full prompts (case D). See below.
+
+### Root cause (single, unifying): stored/live representation carries hidden
+thinking; the replayed request is thinking-stripped, so the two forms cannot
+be content-addressed against each other.
+
+- Live-KV path already mitigates this at the last turn boundary via the
+  in-memory `thinking_live` visible checkpoint (ds4_server.c
+  thinking_live_visible_prefix_prompt / build_toolless_thinking_visible_text)
+  and the `evict`/`shutdown` disk anchor keyed by that visible transcript
+  (kv_cache_store_current). This is why continuation (cases A/B) and
+  continuation-after-eviction both restore.
+- The GAP (case D): prompts beyond `cold_max_tokens` (default 30000) receive
+  NO cold anchor. Their only disk anchors are `continued`
+  (kv_cache_maybe_store_continued) and `evict`, both keyed by the
+  post-generation token stream via ds4_kvstore_render_tokens_text
+  (ds4_kvstore.c:1017) — i.e. INCLUDING the hidden `<think>…</think>` spans.
+  A later re-send or fresh shared-prefix request, whose prompt_text is the
+  canonical thinking-stripped form, can never sha-match those anchors in
+  ds4_kvstore_find_text_prefix (ds4_kvstore.c:1236) -> full re-prefill from
+  ctx=0 (~57 min at 101k). Shallow (<=30k) prompts were unaffected because
+  the existing `cold` anchor is already keyed by the canonical prompt text
+  (ds4_server.c:11201 region), which is exactly why cold anchors "hit" and
+  deep ones did not in the 128k run.
+
+### Fix (operator LAYER 1: canonical, thinking-stripped, template-normalized
+per-turn-boundary content-addressing) — commit ee2722d
+
+Store an aligned near-full `cold` anchor for deep prompts too, keyed by the
+incoming request's rendered prompt text (already the API-visible, canonical
+form). ds4_server.c cold-store block gains an `else if` deep branch
+(prompt_len > cold_max_tokens && opt.deep_cold_anchor) setting
+cold_store_len = kv_cache_store_len(prompt_len). New option
+ds4_kvstore_options.deep_cold_anchor (default true), env kill-switch
+DS4_KV_DEEP_COLD_ANCHOR=0. No change to live-KV reuse, the anthropic/responses
+tool paths, task-16 pinning, or existing anchors. Old token-text deep anchors
+simply remain unmatched (acceptable). Cost bounded by disk budget + LRU +
+pinning. Server self-tests pass (`ds4-server tests: ok`); CPU build clean.
+
+Why not touch the truncation guard (case C): on finish=length the sampled KV
+lacks the closing `</think>`/EOS the visible key would claim, and the next
+turn's replay strips the incomplete thinking, so the byte-prefix key can't
+match regardless. Reusing that KV would be incorrect. Left as-is.
+
+### Acceptance evidence (production ctx=131072, new binary, robo-dog)
+
+ACC1 — multi-turn thinking, delta-only, both APIs: chat turns 2/3
+`match=visible-prefix cached=60/115`, prefill ctx=60..69:9 and 115..124:9
+(~2 s). anthropic turns 2/3 `match=visible-prefix cached=56/107`, prefill
+56..65:9 and 107..116:9. PASS (9-token deltas, not full re-prefill).
+
+ACC4 — multi-turn AT DEPTH (closes the 128k "multi-turn at depth
+unvalidated" gap): 48,619-token facility corpus, thinking enabled.
+Turn 1 full prefill 1542 s (~26 min, one-time). Turns 2-4:
+prompt_tokens 48704 / 48775 / 48851 (deltas +85/+71/+76),
+`match=visible-prefix cached=48691/48758/48837`, prefill
+48691..48704:13 (3.3 s), 48758..48775:17 (3.8 s), 48837..48851:14 (2.8 s).
+Recall correct at depth in genuine back-and-forth: vault code ZULU-7788-QX,
+turbine serial TN-40551-K, and "earliest IMPORTANT RECORD" reasoning all
+answered correctly. PASS — each follow-up turn is delta-only, seconds not
+30+ min.
+
+ACC2 — deep anchor restore across a FULL SERVICE RESTART: turn 1 above stored
+`kv cache stored tokens=47104 trimmed=1515 reason=cold key=token-text
+size=641.45 MiB` (the deep-canonical-anchor branch, prompt 48619 > 30000).
+`systemctl restart ds4-server` (fresh session, model reloaded), then re-sent
+the identical 48,619-token prompt: `kv cache hit text tokens=47104
+key=token-text load=385 ms`, prefill ctx=47104..48619:1515 (66 s), total
+wall 88 s (vs 1542 s cold) -> ~17x. Answer ZULU-7788-QX. PASS. Pre-fix
+baseline for this exact request: full ctx=0 re-prefill (reproduced at small
+scale with cold_max=1024: 1506-token re-send went 0..1506 before fix, and
+1280..1506:226 tail-only after fix).
+
+ACC3 — claude CLI 2-turn regression: measured directly on the anthropic
+tool-result path claude CLI uses (task-9 shape). Turn 1 -> stop_reason
+tool_use (get_code); turn 2 replays assistant thinking+tool_use verbatim +
+the tool_result, and the box logs `anthropic live continuation
+match=tool-output-ids ids=1 cached=428 prompt=445` -> 17-token delta prefill,
+answer correct (QRX-2214), reproducing exactly the task-9 (commit 9c1316d)
+17-token delta. Also exercised by ACC1-anthropic, which replays the full
+assistant content blocks (thinking verbatim, as the CLI does) and still hits
+visible-prefix with a 9-token delta. The fix modifies no code on the live-KV,
+anthropic_live, or tool-result path (only adds deep disk-anchor storage), so
+the task-9 (commit 9c1316d) claude CLI tool-result behavior is preserved by
+construction. NOTE: driving the real `claude` CLI live against the box was not
+a clean measurement here — the CLI's ~21k-token system-prompt context prefills
+in ~14 min at ~25 t/s, longer than the CLI's client-side request timeout, so
+the CLI disconnects mid-prefill and retries (`stream closed during prefill`).
+That is a decode/prefill-speed vs client-timeout mismatch, NOT a continuation
+regression; the box logs during those retries actually show the new anchors
+restoring 10k/20k-token prefixes (`kv cache hit … reason=cold/continued`),
+i.e. the fix helping. Prewarming / faster prefill (task #24 block anchors)
+is the real remedy for interactive deep CLI use.
+
+### Corrected KV bytes/token number
+
+The 128k unit measured ~13.4 MB/1k on-disk and flagged it above the earlier
+~9 MB/1k estimate. Confirmed here: the 47,104-token cold anchor is 641.45 MiB
+= 14.28 MB/1k; the 20,480-token CLI anchor 291.79 MiB = 14.95 MB/1k; the
+10,240-token 157.34 MiB = 16.1 MB/1k. On-disk anchor cost is ~13.5-16 MB/1k
+tokens at ctx=131072 (compressed-row mix plus per-entry text+trailer
+overhead, heavier at smaller token counts). The ~9 MB/1k figure was a
+raw-KV-only estimate and is superseded: budget deep anchors at ~14 MB/1k
+(a full 107k anchor ~= 1.44 GiB, consistent with the 128k table).
+
+### Linkage design note (for tasks #24 block anchors + prewarming)
+
+Three-layer plan (operator, 2026-08-04):
+- LAYER 1 (shipped, this task): canonical-form matching — thinking-stripped,
+  template-normalized — content-addressed per turn boundary. The replayed
+  transcript is its own marker; works for all clients; O(text) sha lookup.
+  Deep prompts now participate via the deep-cold-anchor branch.
+- LAYER 2 (follow-up, NOT built): the anthropic surface already EMITS a
+  `signature` field on thinking blocks (ds4_server.c append_anthropic_thinking
+  :7378, currently the message-id prefix) and clients are required to replay
+  thinking/redacted_thinking blocks verbatim. A server-generated opaque handle
+  embedded there would round-trip legitimately and give O(1) exact session
+  identity + slot affinity without content inference. Incoming parsing
+  currently ignores `signature`; wiring emit->parse->handle->checkpoint table
+  is moderate new code+state, so deferred (not "cheap and clean" after L1).
+- LAYER 3 (note only): OpenAI Responses-style previous_response_id explicit
+  linkage — future.
+
+### Server state
+
+robo-dog ds4-server.service ACTIVE on new binary (ee2722d): /v1/models 200,
+/v1/capabilities configured=131072 trained=65536, DS4_KV_PIN_MIN_HITS=2,
+"deep canonical prompt anchors enabled", chat + deep restore smoke OK. Service
+file UNCHANGED (fix is default-on in the binary; env kill-switch available but
+not set). Instant-rollback IQ2 block untouched.
+
+
+## Task #29 Phase 1: cold-prefill bound diagnosis, cold vs warm expert cache (2026-08-04)
+
+Question: what is bulk prefill bound by NOW (post grouped-prefill a627e80, 70GB cache,
+O_DIRECT, ctx 131072)? Method: ds4-server stopped; manual instance with production flags
+(+DS4_CUDA_STREAM_STATS=1); one ~22k-token cold request on a fresh boot (cold expert
+cache), then two more full-prefill requests in the SAME process (nonce-prefixed prompt
+forces token-mismatch -> full re-prefill; device expert LRU is warm/populated).
+nvidia-smi 5s sampler + iostat -x 5 per arm. Prompt: 78KB of ds4_server.c text,
+21,985-21,988 tokens.
+
+| arm | wall s | prompt tokens | prefill t/s | avg NVMe read | NVMe util | GPU util distribution |
+|---|---|---|---|---|---|---|
+| cold (fresh boot) | 842.1 | 21985 | 26.1 | 3.97 GB/s | 70.4% | ~15-20% of samples at 66-96%, rest 7-9% |
+| warm (same proc)  | 854.9 | 21987 | 25.7 | 3.90 GB/s | 71.0% | similar |
+| warm2             | 852.1 | 21988 | 25.8 | -- | -- | -- |
+
+**Verdict: NVMe-BOUND, via expert-cache capacity thrash.** Warm == cold to within 1.5% --
+the 63.61 GiB expert cache never helps bulk prefill because each 2048-token chunk routes
+to essentially the whole routed expert set, which exceeds the cache, so every chunk
+re-streams from NVMe. Both arms sit at ~3.9 GB/s sustained (the known ~4 GB/s ceiling)
+for the entire prefill: ~3.3 TB read for a 22k prefill, ~310 GB per 2048-token chunk
+(roughly 2x the full routed-expert byte set per chunk). GPU is mostly idle (dominant
+5s sample 7-9% util, with a ~15-20% minority at 66-96% -- the compute share). The old
+"MMA prefill was a no-win because prefill was NVMe-bound" verdict is NOT stale: it is
+still true, now at 26-30 t/s instead of 3.6.
+
+Corollary: today's effective prefill chunk in the server is **2048, not 4096** -- the
+engine cap is 4096 (`prefill_chunk=4096` in the boot line) but
+`server_prefill_quantum_for()` slices session sync into 2048-token quanta when no
+generation is active (`DS4_SERVER_PREFILL_QUANTUM` default), and each quantum is a
+separate engine prefill call with its own full expert sweep. Per-chunk fixed I/O cost +
+small per-token compute means chunk size is the direct lever: double the chunk, halve
+the I/O per token, until the ~15-20% compute share dominates (ceiling ~3-4x). Phase 2 =
+chunk/quantum sweep 4096/8192/16384.
+
+
+## Task #29 Phase 2/3: prefill chunk sweep, 8192 default shipped -- cold 22k prefill 26.1 -> 66.2 t/s (2.54x) (2026-08-04)
+
+Lever chosen per the Phase 1 NVMe-bound verdict: amortize the per-chunk full expert
+sweep over more tokens. Both knobs must move together (the server idle sync quantum
+was the real 2048 clamp; the engine cap alone does nothing). Sweep: fresh boot per
+config (cold expert cache = the target metric), same ~22k corpus, manual instance
+with production flags, one request per config.
+
+| effective chunk (quantum=chunk) | wall s | prefill t/s | vs 2048 | boot plan | MemAvailable warm |
+|---|---|---|---|---|---|
+| 2048 (old default) | 842.1 | 26.1 | 1.0x | 74.01 GiB planned, ctx buffers 3111.75 MiB | ~15-16 GiB |
+| 4096 | 512.6 | 42.9 | 1.64x | 74.01 GiB planned, ctx buffers 3111.75 MiB | 15 GiB |
+| 8192 | 349.8 | 62.9 | 2.41x | 75.33 GiB planned, ctx buffers 4460.31 MiB | 9 GiB |
+| 16384 | FAILED | -- | -- | 77.33 GiB planned, ctx buffers 6512.43 MiB | -- |
+
+16384 fails hard at request time: "gpu layer 2 attention batch encode failed" ->
+HTTP 500 (attention batch encoder limit; not chased -- 8192 is inside the 2-3x
+target and the attention n^2 term erodes returns beyond it anyway). Scaling is
+sublinear (1.64x/2.41x vs ideal 2x/4x) because the compute share (~15-20% of wall
+at 2048) grows as I/O amortizes.
+
+Shipped (commit "default CUDA ssd-streaming server prefill chunk + idle sync
+quantum to 8192"): ds4-server defaults engine prefill_chunk to 8192 when
+ssd-streaming + CUDA and --prefill-chunk unset; idle sync quantum follows the
+engine chunk (server_prefill_quantum_for2), mixed quantum stays 128 for
+interactivity. --prefill-chunk / DS4_SERVER_PREFILL_QUANTUM /
+DS4_SERVER_MIXED_PREFILL_QUANTUM all still override. Non-streaming and non-CUDA
+servers keep the old 2048 idle default. Production benefits with NO service-file
+change.
+
+### Verification (new binary, production flags, no env)
+
+- Boot line confirms defaults: prefill_quantum=8192 mixed_prefill_quantum=128,
+  prefill_chunk=8192, plan 75.33 GiB.
+- **Final cold-20k-class number: 21,974 tokens in 331.9 s = 66.2 t/s = 2.54x**
+  vs the 26.1 t/s baseline (a 20k cold prompt now ~5.0 min, was ~12.6 min --
+  meets the 3-5 min target at the top of the band).
+- Greedy identity: 5k-token prompt, temperature=0, 80 tokens -- chunk 8192 vs
+  forced legacy 2048 on the same binary: **IDENTICAL** output text.
+- Decode: shallow 200-token greedy turn 4.45 t/s incl. its prefill (normal range;
+  decode path untouched by both changes -- quantum only differs when no generation
+  is active, and only for prefill).
+- Memory: MemAvailable 9 GiB measured right after the 22k prefill on the manual
+  instance (floor 8 GiB) -- the 8192 shared prefill workspace costs ~4-5 GiB over
+  the 2048 config (the "N resident sessions request at least X GiB" line went
+  6.08 -> 8.71 GiB and the aliased workspace scales with cap). Thin but above
+  floor; worth watching on the first deep (100k) prefill under the new default.
+- Production restored: systemctl active, /v1/models 200, /v1/capabilities OK,
+  chat smoke OK, new boot lines confirmed in journal. Service file untouched.
+  Nothing experimental left on (MMA gate untouched, still default OFF).
+
+### What remains
+
+- The remaining gap to the ~4 GB/s I/O floor at chunk 8192 is roughly half I/O,
+  half compute. Task #14's expert-major repack would cut per-sweep read
+  amplification (observed ~310 GB fetched per 2048-token chunk vs ~137 GiB of
+  routed expert bytes -- about 2x amplification from layout/readahead); combined
+  with chunk 8192 the amplification fix is worth up to another ~1.5x on cold
+  prefill before compute dominates.
+- MMA prefill stays a no-win while NVMe-bound (Phase 1 re-confirmed the old
+  verdict); it becomes relevant only after #14-class I/O wins.
+
+
+## Task #14: accretion-prepare v0 -- expert-major/4KB repack A/B: alignment buys throughput efficiency, not fewer bytes (2026-08-04)
+
+Tool: `nexus-cw/accretion` `tools/accretion-prepare/` (python3+numpy, streaming,
+never loads the model in RAM). One command, 4 stages: FETCH (verify size/sha),
+NORMALIZE (dialect normalization moved to convert time -- transplant of the
+9c4b760/99e7f1a/f7ec45f/3106c3c/0528b32 load-time compat: derived
+deepseek4.vocab_size=129280; 13 dense tensor families BF16/2D-F32 -> F16, 0
+clamps; GA tensor names were already canonical, 0 renames), OPTIMIZE
+(general.alignment=4096, every tensor offset 4KB-padded; data order dense-first
+then per-layer gate/up/down routed tensors; MXFP4 expert slice = 4,456,448 B =
+1088*4096, so EVERY (layer,expert) slice is 4KB-aligned), MANIFEST (33,024
+expert entries + 1,199 dense entries, per-entry file/offset/len/location).
+Repack of the 156.4GB GA artifact: 1148s, output 156,309,032,960 B on /data,
+sha256 dedd760b... Root NVMe untouched throughout (112G free before = 111G after).
+
+### Verification ladder
+1. Manifest offsets: 5 random experts byte-IDENTICAL to source slices, all
+   offsets 4096-aligned; dense spot-checks OK (FAILS=0).
+2. Native load: manual ds4-server on the repacked file, production flags --
+   **dialect_compat_lines=0** (the entire point of NORMALIZE), models 200,
+   6k-token chat smoke OK.
+3. Greedy identity (temp 0, 80 tok, 6.2k-token prompt, same binary/flags,
+   fresh per-arm KV dirs, only -m differs): **IDENTICAL**.
+4. Eval smoke on repacked: **4/4 PASSED** (GPQA Diamond x2, SuperGPQA, AIME2025).
+
+### Layout A/B (cold 22k prefill, chunk 8192, DISK HELD CONSTANT)
+Disk probes: /data (sda SATA-class SSD) 519 MB/s seq O_DIRECT, root NVMe 5.1
+GB/s -- /data is ~10x slower, so BOTH arms ran from /data (original was already
+mirrored there, byte-identical size). After each drop_caches the ~8.5 GiB dense
+range set was page-cache prewarmed symmetrically in both arms (buffered reads;
+the measured expert-stream path is O_DIRECT and unaffected). Discovery en route:
+the ORIGINAL-layout boot from /data is pathological without the prewarm
+(~0.7 GiB dense loaded in 25 min -- scattered 32B-aligned dense tensors on the
+O_DIRECT load path), while the repacked dense-first/4KB file boots in minutes:
+a real operational win for slow media on its own.
+
+| arm (from /data) | wall s | prompt tok | prefill t/s | GiB read | avg read | r_await | util |
+|---|---|---|---|---|---|---|---|
+| original layout  | 2498.4 | 21974 | 8.80 | 1101 | 449 MB/s | ~48 ms | ~86% |
+| accretion repack | 2208.4 | 21974 | **9.95** | 1110 | 512 MB/s | ~5-6 ms | ~88% |
+
+- **Wall win 1.13x** (2498 -> 2208 s), matching the sustained-throughput ratio
+  (512/449 = 1.14x) at equal disk utilization.
+- **Read amplification is UNCHANGED**: ~1.1 TB read by both arms = ~2.7x the
+  137 GiB routed set per 8192-token chunk sweep (3 sweeps for 22k). The
+  amplification is expert-cache capacity thrash (task#29 phase-1 verdict), not
+  alignment edge waste -- at ~500 KB avg request size the <=511 B unaligned
+  edge is ~0.1% of bytes. The layout cannot and did not reduce bytes read.
+- The win mechanism is per-read efficiency: aligned 4KB O_DIRECT requests cut
+  r_await ~9x on this SSD and lift sustained throughput ~14%.
+
+### Projection to root NVMe (stated assumptions, not measured)
+This A/B measures the layout's RELATIVE effect with the disk held constant on
+a ~480 MB/s-class SSD. Since bytes read are unchanged, any root-NVMe gain can
+only come from the same per-read-efficiency mechanism. Root NVMe already
+sustains 3.9 GB/s at ~70% util with the unaligned layout (task#29 baseline
+66.2 t/s / 331.9 s), i.e. its queue is far less latency-bound, so the 1.14x
+observed here is an UPPER bound there. Projected root-NVMe numbers: between
+66.2 t/s (no change) and ~75 t/s / ~292 s (full 1.14x transfer). **Verdict:
+the ~1.5x hoped-for layout win is NOT there** -- amplification is cache-thrash
+-driven and layout-invariant; the honest wins are (1) zero dialect-compat load
+paths, (2) 4KB/O_DIRECT-native artifact + per-expert offset manifest
+(appendable-store-ready), (3) ~14% throughput on IOPS/latency-limited media
+and a boots-at-all fix for slow media, (4) a repeatable ingest pipeline.
+Next lever for the 1.5x question remains chunk>8192 (needs the attention
+batch-encode limit fixed) or smarter per-chunk expert scheduling, not layout.
+
+Production: restored on the ORIGINAL file and verified (models 200,
+capabilities, chat smoke). Promotion of the repacked artifact is the
+operator's call; it is drop-in (identity-verified) and lives at
+/data/gguf/accretion/ with its manifest.
