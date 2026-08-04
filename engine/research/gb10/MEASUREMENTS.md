@@ -4435,3 +4435,56 @@ Production: restored on the ORIGINAL file and verified (models 200,
 capabilities, chat smoke). Promotion of the repacked artifact is the
 operator's call; it is drop-in (identity-verified) and lives at
 /data/gguf/accretion/ with its manifest.
+
+## Task #24 — layered KV anchor chains + POST /v1/prewarm (2026-08-05)
+
+Design + rules: KV_CHAINS.md. ds4 commits 47fca67 + 2 follow-ups (near-final
+turn boundaries kept; prewarm guard requires fully idle server). All numbers
+below on robo-dog, production config (ctx=131072, batched-session 2,
+ssd-streaming 70GB expert cache), manual instance, fresh 16 GiB kv dir,
+temperature 0.
+
+Premise verified in code: ds4_kvstore_find_text_prefix scans all stored
+entries and picks the longest sha-matching text prefix, so chain checkpoints
+keyed by canonical text prefixes need no new matching machinery.
+
+### Chain arithmetic (measured)
+~16 MiB KV per 1k tokens. 49,710-token cold prefill stored a 7-entry lineage
+(8192/16384/20173-turn-boundary/24576/32768 chain + 40960 continued + 49152
+terminal deep-cold) totaling ~2.7 GiB; chain save cost 176-775 ms per link,
+~1.8 s total on a 570.9 s prefill (0.3% overhead). Extrapolated 128k lineage
+at defaults ~10 GiB -> recommend raising the 16 GiB kv budget to 32-48 GB if
+deep chain use becomes routine (no service change made).
+
+### Acceptance
+A — mid-prompt edit (49,710-token prompt, ~20k system + ~30k user):
+  cold 570.9 s; unedited re-send after restart: restore 49152 (357 ms load) +
+  558-token tail = 58.2 s wall (~9.8x); EDITED at ~60% depth (record at
+  ~29.8k tokens amended), fresh sessions: kv cache hit tokens=24576 (deepest
+  chain link before the edit, 209 ms load) + 25,138-token tail = 280.8 s wall
+  vs 570.9 cold (~2x, exactly the tail fraction). PASS.
+B — turn-boundary reuse: 5-message session stored boundaries 2537 and 5091 +
+  terminal 6144; after restart, a NEW session sharing only the first 2 turns
+  restored tokens=5091 (the deepest shared user-marker boundary, 70 ms) with
+  a 2,556-token tail (70.0 s). PASS (needed the near-final-boundary follow-up
+  commit; the first cut excluded boundaries within 2048 of the terminal store).
+C — prewarm: POST /v1/prewarm, 20,177-token Anthropic-shaped body on a cold
+  store -> {restored 0, prefilled 20177, anchors 3, wall 210557 ms}, chain
+  8192/16384 + 20173 turn-boundary terminal stored. Immediately-following
+  normal request with the same system prompt: hit tokens=20173 load=100 ms,
+  17-token tail, prompt done 9.3 s (client wall 18.3 s incl. generation) vs
+  210 s cold. Second prewarm of the same body: {restored 20177, prefilled 0,
+  wall 0.1 ms}. Guard: 503 while a generation is active (fully-idle rule),
+  admitted again immediately after. PASS.
+D — regressions: delta-only follow-up turn restored 2048 + 542-token tail in
+  seconds (live visible-prefix/tool paths untouched by construction — chain
+  code only adds stores on the cold path). Greedy identity: same prompt with
+  DS4_KV_CHAIN_INTERVAL=0 vs default -> outputs byte-IDENTICAL (chain storage
+  does not alter prefill computation). make cpu clean (no warnings). PASS.
+
+Layer-2 session handle (signature emit->parse): assessed, SKIPPED as >1 day;
+verdict + follow-up notes in KV_CHAINS.md.
+
+Production: restored on systemd service (chain default-on in the new binary),
+verified models 200 + capabilities 200 + console 200 + chat smoke; kv dir
+16G at budget; scratch measurement kv dirs removed.

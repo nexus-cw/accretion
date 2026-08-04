@@ -62,6 +62,8 @@ payload carries this note verbatim).
   },
   "kv_events": {                       // this uptime
     "stores": 12,
+    "chain_stores": 5,                 // layered anchor chain checkpoints (task #24)
+    "prewarm_requests": 1,
     "restores": 3,
     "restored_tokens_total": 45000,
     "last_restore_tokens": 22000,
@@ -71,6 +73,21 @@ payload carries this note verbatim).
 ```
 
 `GET /activity` is an alias, mirroring `/capabilities`.
+
+## `POST /v1/prewarm`
+
+Proactive prefill (task #24): body is a standard messages request in either
+dialect. The server canonicalizes, restores matching KV anchors, prefills the
+remainder, stores the layered anchor chain — exactly as a normal request —
+but generates zero tokens and returns:
+
+```json
+{"restored_tokens": 0, "prefilled_tokens": 20177, "anchors_stored": 3, "wall_ms": 210557.2}
+```
+
+Idle-priority: refused with `503` unless the server is fully idle (never
+queued behind generation); when admitted it runs on the idle prefill quantum.
+This is the primitive for the ship/install/watch prewarming tiers.
 
 ## v1 roadmap
 
