@@ -74,6 +74,36 @@ payload carries this note verbatim).
 
 `GET /activity` is an alias, mirroring `/capabilities`.
 
+## `GET /v1/routing-stats`
+
+Per-(layer,expert) routing-traffic telemetry (task #28), aggregated at
+request time from persistent counters on the routed-MoE dispatch path.
+Same conventions as `/v1/activity`: lock-free snapshot, no GPU work, safe
+to poll; counters are cumulative across restarts (model-keyed file under
+`~/.ds4/routing-stats/`). `GET /routing-stats` is an alias.
+
+Sections: `totals` (selections, decode/prefill tokens, distinct keys, LRU
+hits/misses/hit_rate), `persistence`, `top_experts` (hottest N by
+selections, `DS4_ROUTING_TOPN` env, default 20), `per_layer` (selections,
+unique experts, selection-distribution entropy in nats vs max,
+high-router-entropy token counts), `router_entropy`, `coverage` (selection
+share of the hottest 10/25/50% of keys), and — on CUDA streaming builds —
+`advisor`: for budgets 50/55/60/63.6/70 GiB, `cache_experts` (K =
+budget/expert_bytes) and `estimated_hit_rate_static`, the honestly-named
+static popularity-skew approximation of "what would trimming the cache
+cost".
+
+```json
+"advisor": {"expert_bytes": 13369344, "budgets": [
+  {"budget_gib": 63.6, "cache_experts": 5107, "estimated_hit_rate_static": 0.9582}]}
+```
+
+The console's **ROUTING** section renders this: per-layer entropy bars,
+top-10 hottest experts, and the advisor table, polled every 10 s.
+`DS4_ROUTING_COUNTERS=0` disables the counters entirely (endpoint then
+reports `enabled: false`). CPU builds serve the endpoint with zero counters
+and no advisor.
+
 ## `POST /v1/prewarm`
 
 Proactive prefill (task #24): body is a standard messages request in either
