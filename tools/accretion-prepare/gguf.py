@@ -42,6 +42,7 @@ GGML_TYPES = {
     28: ('F64', 1, 8),
     30: ('BF16', 1, 2),
     39: ('MXFP4', 32, 17),
+    40: ('NVFP4', 64, 36),  # block/bytes per ds4 gguf-tools/quants.h
 }
 TYPE_BY_NAME = {v[0]: k for k, v in GGML_TYPES.items()}
 
