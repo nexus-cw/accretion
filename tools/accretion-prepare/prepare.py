@@ -19,82 +19,33 @@ Stages (each skippable):
              (layer,expert) offset table, dense-tensor table; every
              entry carries a `location` field (local file for v0)
 
-v0 limits: deepseek4-family descriptor only; FETCH is verify-only (no
-downloader); pure-python streaming (numpy for dtype conversion).
+Family knowledge (metadata derivation rules, tensor-name aliases,
+dense-type conversion policy, expert-tensor patterns, alignment) lives
+in per-family descriptors under descriptors/ -- the primary arch seam
+(task #26). See descriptors/__init__.py for the contract.
+
+v0 limits: FETCH is verify-only (no downloader); pure-python streaming
+(numpy for dtype conversion).
 """
 import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 
 import numpy as np
 
 import gguf
+import descriptors
 
 SCHEMA_VERSION = 1
 CHUNK = 64 * 1024 * 1024
-
-# ---------------------------------------------------------------------------
-# deepseek4 descriptor (v0: the only supported family)
-# ---------------------------------------------------------------------------
-
-# Shape constants for keys no tensor encodes, keyed by block_count
-# (mirrors ds4.c DS4_SHAPE_FLASH / DS4_SHAPE_PRO dialect-compat tier).
-DS4_SHAPES = {
-    43: dict(name='deepseek-v4-flash', n_hc_sinkhorn_iter=20,
-             compress_rope_freq_base=160000.0, hc_eps=1e-06,
-             compress_ratio=lambda il: 0 if il < 2 else (4 if il % 2 == 0 else 128)),
-    61: dict(name='deepseek-v4-pro', n_hc_sinkhorn_iter=20,
-             compress_rope_freq_base=160000.0, hc_eps=1e-06,
-             compress_ratio=lambda il: 128 if il < 2 else (4 if il % 2 == 0 else 128)),
-}
-
-# alias (community dialect) -> canonical (llama.cpp/ds4 GGUF convention).
-# Per-layer names use {L}. Transplant of ds4.c commit 99e7f1a.
-TENSOR_ALIASES = {
-    'hc_head_base': 'output_hc_base.weight',
-    'hc_head_fn': 'output_hc_fn.weight',
-    'hc_head_scale': 'output_hc_scale.weight',
-    'blk.{L}.hc_attn_fn': 'blk.{L}.hc_attn_fn.weight',
-    'blk.{L}.hc_attn_scale': 'blk.{L}.hc_attn_scale.weight',
-    'blk.{L}.hc_attn_base': 'blk.{L}.hc_attn_base.weight',
-    'blk.{L}.hc_ffn_fn': 'blk.{L}.hc_ffn_fn.weight',
-    'blk.{L}.hc_ffn_scale': 'blk.{L}.hc_ffn_scale.weight',
-    'blk.{L}.hc_ffn_base': 'blk.{L}.hc_ffn_base.weight',
-    'blk.{L}.attn_sinks': 'blk.{L}.attn_sinks.weight',
-    'blk.{L}.attn_kv_latent.weight': 'blk.{L}.attn_kv.weight',
-    'blk.{L}.exp_probs_b': 'blk.{L}.exp_probs_b.bias',
-    'blk.{L}.ffn_gate_tid2eid': 'blk.{L}.ffn_gate_tid2eid.weight',
-    'blk.{L}.attn_compress_ape': 'blk.{L}.attn_compressor_ape.weight',
-    'blk.{L}.attn_compress_kv.weight': 'blk.{L}.attn_compressor_kv.weight',
-    'blk.{L}.attn_compress_gate.weight': 'blk.{L}.attn_compressor_gate.weight',
-    'blk.{L}.attn_compress_norm.weight': 'blk.{L}.attn_compressor_norm.weight',
-    'blk.{L}.indexer.compress_ape': 'blk.{L}.indexer_compressor_ape.weight',
-    'blk.{L}.indexer.compress_kv.weight': 'blk.{L}.indexer_compressor_kv.weight',
-    'blk.{L}.indexer.compress_gate.weight': 'blk.{L}.indexer_compressor_gate.weight',
-    'blk.{L}.indexer.compress_norm.weight': 'blk.{L}.indexer_compressor_norm.weight',
-}
-
-ROUTED_RE = re.compile(r'^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$')
 
 
 def log(msg):
     sys.stderr.write('accretion-prepare: %s\n' % msg)
     sys.stderr.flush()
-
-
-def canonical_name(name):
-    m = re.match(r'^blk\.(\d+)\.(.*)$', name)
-    if m:
-        il, rest = m.group(1), m.group(2)
-        key = 'blk.{L}.' + rest
-        if key in TENSOR_ALIASES:
-            return TENSOR_ALIASES[key].replace('{L}', il)
-        return name
-    return TENSOR_ALIASES.get(name, name)
 
 
 def get_u32(md, key):
@@ -106,90 +57,6 @@ def find_tensor(g, name):
         if t.name == name:
             return t
     return None
-
-
-def derive_metadata(g, xlog):
-    """Add canonical deepseek4.* keys the source omits, derived from tensor
-    shapes/presence (preferred) or shape constants (fallback). Transplant of
-    ds4.c deepseek4 dialect compat (9c4b760 + f7ec45f), run once at convert
-    time so the output loads with zero dialect-compat lines."""
-    md = g.metadata
-    arch = md.get('general.architecture', (None, None))[1]
-    if arch != 'deepseek4':
-        raise SystemExit('v0 only supports general.architecture=deepseek4 (got %r)' % arch)
-    n_layer = get_u32(md, 'deepseek4.block_count')
-    n_embd = get_u32(md, 'deepseek4.embedding_length')
-    n_head = get_u32(md, 'deepseek4.attention.head_count')
-    n_head_dim = get_u32(md, 'deepseek4.attention.key_length')
-    shape = DS4_SHAPES.get(n_layer)
-
-    def add(key, vtype, val, how):
-        if key in md:
-            return
-        md[key] = (vtype, val)
-        xlog.append({'stage': 'normalize', 'action': 'derive_metadata',
-                     'key': key, 'value': val if vtype != gguf.T_ARR else 'array(n=%d)' % len(val[1]),
-                     'derivation': how})
-        log('normalize: derived %s = %r (%s)' % (key, val if vtype != gguf.T_ARR else '<array>', how))
-
-    # vocab_size from tokenizer token list, cross-checked vs embedding dims
-    if 'deepseek4.vocab_size' not in md:
-        toks = md.get('tokenizer.ggml.tokens')
-        if toks:
-            n_vocab = len(toks[1][1])
-            for tn in ('token_embd.weight', 'output.weight'):
-                t = find_tensor(g, canonical_name(tn)) or find_tensor(g, tn)
-                if t and len(t.dims) >= 2 and t.dims[1] != n_vocab:
-                    raise SystemExit('vocab_size derivation disagrees: tokens=%d vs %s dim1=%d'
-                                     % (n_vocab, tn, t.dims[1]))
-            add('deepseek4.vocab_size', gguf.T_U32, n_vocab,
-                'tokenizer.ggml.tokens length, cross-checked vs token_embd/output vocab dim')
-
-    # output_lora_rank / output_group_count from attn_output_a/b dims
-    if ('deepseek4.attention.output_lora_rank' not in md or
-            'deepseek4.attention.output_group_count' not in md):
-        ta = find_tensor(g, 'blk.0.attn_output_a.weight')
-        tb = find_tensor(g, 'blk.0.attn_output_b.weight')
-        if ta and tb and n_head and n_head_dim:
-            prod = n_head * n_head_dim
-            if ta.dims[0] and prod % ta.dims[0] == 0:
-                groups = prod // ta.dims[0]
-                if groups and tb.dims[0] % groups == 0:
-                    add('deepseek4.attention.output_group_count', gguf.T_U32, groups,
-                        'n_head*key_length / dim0(blk.0.attn_output_a.weight)')
-                    add('deepseek4.attention.output_lora_rank', gguf.T_U32, tb.dims[0] // groups,
-                        'dim0(blk.0.attn_output_b.weight) / output_group_count')
-
-    # hash_layer_count = contiguous run of ffn_gate_tid2eid from layer 0
-    if 'deepseek4.hash_layer_count' not in md:
-        cnt = 0
-        for il in range(n_layer):
-            if not (find_tensor(g, 'blk.%d.ffn_gate_tid2eid.weight' % il) or
-                    find_tensor(g, 'blk.%d.ffn_gate_tid2eid' % il)):
-                break
-            cnt += 1
-        add('deepseek4.hash_layer_count', gguf.T_U32, cnt,
-            'count of present blk.<i>.ffn_gate_tid2eid tensors')
-
-    # hyper_connection.count from hc_attn_fn dim0 / n_embd
-    if 'deepseek4.hyper_connection.count' not in md:
-        t = (find_tensor(g, 'blk.0.hc_attn_fn.weight') or find_tensor(g, 'blk.0.hc_attn_fn'))
-        if t and n_embd and t.dims[0] % n_embd == 0:
-            add('deepseek4.hyper_connection.count', gguf.T_U32, t.dims[0] // n_embd,
-                'dim0(blk.0.hc_attn_fn) / embedding_length')
-
-    # pure shape constants (no tensor encodes them)
-    if shape:
-        add('deepseek4.hyper_connection.sinkhorn_iterations', gguf.T_U32,
-            shape['n_hc_sinkhorn_iter'], 'shape constant (%s)' % shape['name'])
-        add('deepseek4.attention.compress_rope_freq_base', gguf.T_F32,
-            shape['compress_rope_freq_base'], 'shape constant (%s)' % shape['name'])
-        add('deepseek4.hyper_connection.epsilon', gguf.T_F32,
-            shape['hc_eps'], 'shape constant (%s)' % shape['name'])
-        if 'deepseek4.attention.compress_ratios' not in md:
-            ratios = [shape['compress_ratio'](il) for il in range(n_layer)]
-            add('deepseek4.attention.compress_ratios', gguf.T_ARR,
-                (gguf.T_I32, ratios), 'shape constant pattern (%s)' % shape['name'])
 
 
 # ---------------------------------------------------------------------------
@@ -254,19 +121,6 @@ CONVERTERS = {
 }
 
 
-def is_dense_conversion_candidate(t):
-    """ds4.c tensor_is_dense_conversion_candidate, deepseek4 family."""
-    tn = gguf.type_name(t.ggml_type)
-    nd = len(t.dims)
-    if nd > 2:
-        return False
-    if tn in ('BF16', 'Q6_K'):
-        return True
-    if tn == 'F32' and nd == 2:
-        return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # pipeline
 # ---------------------------------------------------------------------------
@@ -301,6 +155,9 @@ def main():
                     help='compute source sha256 (extra full read pass)')
     ap.add_argument('--skip-normalize', action='store_true')
     ap.add_argument('--skip-optimize', action='store_true')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='parse header, select descriptor, plan normalize/'
+                         'optimize and print a summary; write nothing')
     args = ap.parse_args()
 
     xlog = []
@@ -327,27 +184,42 @@ def main():
     log('parsed header: %d tensors, %d kv, data_start=%d, alignment=%d' %
         (len(g.tensors), len(g.metadata), g.data_start, g.alignment))
 
+    # ---- descriptor selection (the arch seam) ----
+    arch = g.metadata.get('general.architecture', (None, None))[1]
+    desc = descriptors.select(g, log=log)
+    log('descriptor: %s (architecture %r)' % (desc.name, arch))
+    xlog.append({'stage': 'select', 'action': 'descriptor',
+                 'descriptor': desc.name, 'architecture': arch})
+    routed_re = desc.expert_pattern
+
     # ---- NORMALIZE ----
     stats = {'clamped': 0}
     renames = 0
-    arch = g.metadata.get('general.architecture', (None, None))[1]
-    if arch != 'deepseek4' and not args.skip_normalize:
-        log("normalize: architecture %r is not deepseek4 -- skipping dialect "
-            "normalization (generic stages only)" % arch)
-        xlog.append({'stage': 'normalize', 'action': 'skip_foreign_arch',
-                     'architecture': arch})
+    if not desc.normalizes() and not args.skip_normalize:
+        if desc.name == 'generic':
+            # graceful skip for unknown archs (ee2f023 behavior)
+            log("normalize: architecture %r has no descriptor -- skipping "
+                "dialect normalization (generic stages only)" % arch)
+            xlog.append({'stage': 'normalize', 'action': 'skip_foreign_arch',
+                         'architecture': arch})
+        else:
+            log('normalize: descriptor %s requires no dialect normalization'
+                % desc.name)
+            xlog.append({'stage': 'normalize',
+                         'action': 'no_normalization_required',
+                         'descriptor': desc.name, 'architecture': arch})
         args.skip_normalize = True
     if not args.skip_normalize:
-        derive_metadata(g, xlog)
+        desc.derive_metadata(g, xlog)
         for t in g.tensors:
-            cn = canonical_name(t.name)
+            cn = desc.canonical_name(t.name)
             if cn != t.name:
                 xlog.append({'stage': 'normalize', 'action': 'rename_tensor',
                              'from': t.name, 'to': cn})
                 t.name = cn
                 renames += 1
         log('normalize: %d tensor renames' % renames)
-        conv = [t for t in g.tensors if is_dense_conversion_candidate(t)]
+        conv = [t for t in g.tensors if desc.dense_type_policy(t)]
         for t in conv:
             xlog.append({'stage': 'normalize', 'action': 'convert_dense',
                          'tensor': t.name, 'from': gguf.type_name(t.ggml_type), 'to': 'F16'})
@@ -357,15 +229,15 @@ def main():
     conv_set = set(id(t) for t in conv)
 
     # ---- OPTIMIZE: layout plan ----
-    alignment = 32 if args.skip_optimize else 4096
+    alignment = 32 if args.skip_optimize else desc.alignment
     if not args.skip_optimize:
         g.metadata['general.alignment'] = (gguf.T_U32, alignment)
-        routed = [t for t in g.tensors if ROUTED_RE.match(t.name)]
-        dense = [t for t in g.tensors if not ROUTED_RE.match(t.name)]
+        routed = [t for t in g.tensors if routed_re.match(t.name)]
+        dense = [t for t in g.tensors if not routed_re.match(t.name)]
         dense.sort(key=lambda t: t.offset)
         by_layer = {}
         for t in routed:
-            m = ROUTED_RE.match(t.name)
+            m = routed_re.match(t.name)
             by_layer.setdefault(int(m.group(1)), {})[m.group(2)] = t
         order = list(dense)
         for il in sorted(by_layer):
@@ -397,6 +269,15 @@ def main():
         t.offset = pos
         pos += t.nbytes
     total_out_data = pos
+
+    if args.dry_run:
+        n_routed_plan = sum(1 for t in order if routed_re.match(t.name))
+        log('dry-run: descriptor=%s arch=%r alignment=%d tensors=%d '
+            '(routed %d, dense %d) renames=%d dense-convert=%d '
+            'planned_data_bytes=%d -- nothing written'
+            % (desc.name, arch, alignment, len(order), n_routed_plan,
+               len(order) - n_routed_plan, renames, len(conv), total_out_data))
+        return
 
     os.makedirs(args.out, exist_ok=True)
     base = os.path.splitext(os.path.basename(src))[0]
@@ -503,7 +384,7 @@ def main():
                 })
     dense_tab = []
     for t in order:
-        if ROUTED_RE.match(t.name):
+        if routed_re.match(t.name):
             continue
         dense_tab.append({
             'name': t.name, 'dtype': gguf.type_name(t.ggml_type),
@@ -520,8 +401,8 @@ def main():
         'output': {'name': out_base, 'size': out_size,
                    'sha256': out_sha.hexdigest(), 'data_start': data_start,
                    'alignment': alignment},
-        'model': {'architecture': arch, 'n_layer': n_layer,
-                  'n_expert': n_expert},
+        'model': {'architecture': arch, 'descriptor': desc.name,
+                  'n_layer': n_layer, 'n_expert': n_expert},
         'transforms': xlog,
         'experts': experts,
         'dense_tensors': dense_tab,
