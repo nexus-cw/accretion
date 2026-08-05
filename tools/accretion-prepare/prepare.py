@@ -330,6 +330,13 @@ def main():
     # ---- NORMALIZE ----
     stats = {'clamped': 0}
     renames = 0
+    arch = g.metadata.get('general.architecture', (None, None))[1]
+    if arch != 'deepseek4' and not args.skip_normalize:
+        log("normalize: architecture %r is not deepseek4 -- skipping dialect "
+            "normalization (generic stages only)" % arch)
+        xlog.append({'stage': 'normalize', 'action': 'skip_foreign_arch',
+                     'architecture': arch})
+        args.skip_normalize = True
     if not args.skip_normalize:
         derive_metadata(g, xlog)
         for t in g.tensors:
@@ -475,8 +482,8 @@ def main():
                  'tensors_converted': len(conv), 'values_clamped': stats['clamped']})
 
     # ---- MANIFEST ----
-    n_layer = get_u32(g.metadata, 'deepseek4.block_count')
-    n_expert = get_u32(g.metadata, 'deepseek4.expert_count')
+    n_layer = get_u32(g.metadata, '%s.block_count' % arch)
+    n_expert = get_u32(g.metadata, '%s.expert_count' % arch)
     out_base = os.path.basename(out_path)
     experts = []
     for il in range(n_layer or 0):
@@ -513,7 +520,7 @@ def main():
         'output': {'name': out_base, 'size': out_size,
                    'sha256': out_sha.hexdigest(), 'data_start': data_start,
                    'alignment': alignment},
-        'model': {'architecture': 'deepseek4', 'n_layer': n_layer,
+        'model': {'architecture': arch, 'n_layer': n_layer,
                   'n_expert': n_expert},
         'transforms': xlog,
         'experts': experts,
