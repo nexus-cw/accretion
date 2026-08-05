@@ -4,6 +4,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_routing_stats.h"
 #include "rax.h"
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 /* CUDA-only expert-cache byte counters for /v1/capabilities. */
@@ -667,6 +668,10 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    /* POST /v1/prewarm: run canonicalization + restore + prefill + anchor
+     * storage exactly as a normal request, generate zero tokens, and answer
+     * with a JSON accounting object instead of a completion. */
+    bool prewarm;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -8249,6 +8254,9 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Anchor checkpoints stored during the current request (chain + cold +
+     * continued); reported by POST /v1/prewarm. */
+    int req_anchors_stored;
 
     job *assigned;
     bool busy;
@@ -8316,6 +8324,12 @@ struct server {
      * kv_mu is already held on the store/load paths; read lock-free by the
      * activity endpoint (slightly stale reads are fine). */
     unsigned long long act_kv_stores;
+    unsigned long long act_kv_chain_stores;
+    unsigned long long act_prewarm_requests;
+    /* Jobs currently executing on a slot worker (under s->mu).  Used by the
+     * POST /v1/prewarm guard: prewarm is idle-priority and is refused (503)
+     * rather than queued behind interactive work. */
+    int active_jobs;
     unsigned long long act_kv_restores;
     unsigned long long act_kv_restored_tokens;
     int act_kv_last_restore_tokens;
@@ -9319,7 +9333,10 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
-    if (ok) s->act_kv_stores++;
+    if (ok) {
+        s->act_kv_stores++;
+        slot->req_anchors_stored++;
+    }
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
@@ -11028,6 +11045,7 @@ static uint64_t server_next_sequence(server *s) {
 static void generate_job(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
+    slot->req_anchors_stored = 0;
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -11276,6 +11294,51 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             kv_cache_slot_suppress_continued(s, slot, cold_store_len);
     }
 
+    /* Layered anchor chain (task #24): while this cold prefill is running
+     * anyway, park at each turn boundary / interval depth below the terminal
+     * cold store and checkpoint the KV state there, keyed by the canonical
+     * text prefix up to that depth.  A later request whose canonical prompt
+     * diverges at depth D (mid-prompt edit, shared-turns-only session)
+     * content-addresses the deepest chain link before D through the existing
+     * longest-text-prefix lookup and re-prefills only the tail.  The stores
+     * are incremental: the KV state at each depth exists exactly once, here. */
+    if (s->kv.enabled && cold_store_len >= s->kv.opt.min_tokens) {
+        int chain_depths[64];
+        const int chain_n = ds4_kvstore_chain_depths(
+            &s->kv, prompt_for_sync,
+            ds4_token_user(s->engine), ds4_token_assistant(s->engine),
+            cold_store_len, chain_depths,
+            (int)(sizeof(chain_depths) / sizeof(chain_depths[0])));
+        for (int ci = 0; ci < chain_n; ci++) {
+            const int depth = chain_depths[ci];
+            ds4_tokens chain_prefix = {0};
+            tokens_copy_prefix(&chain_prefix, prompt_for_sync, depth);
+            const int sync_rc = server_session_sync(s, slot, &chain_prefix,
+                                                    err, sizeof(err));
+            ds4_tokens_free(&chain_prefix);
+            if (sync_rc != 0) {
+                ds4_tokens_free(&effective_prompt);
+                ds4_session_set_progress(slot->session, NULL, NULL);
+                ds4_session_set_display_progress(slot->session, NULL, NULL);
+                kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
+                                                 cold_store_len);
+                kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+                free(disk_cache_path);
+                trace_event(s, trace_id, "prefill failed: %s", err);
+                send_prefill_failure_response(s, j, &progress, ctx_span,
+                                              req_flags, err);
+                return;
+            }
+            if (kv_cache_store_live_prefix(s, slot, prompt_for_sync, depth,
+                                           "cold")) {
+                kv_cache_slot_note_store(slot, depth);
+                s->act_kv_chain_stores++;
+                trace_event(s, trace_id, "kv chain checkpoint stored depth=%d",
+                            depth);
+            }
+        }
+    }
+
     if (s->kv.enabled &&
         cold_store_len >= s->kv.opt.min_tokens &&
         cold_store_len < prompt_for_sync->len)
@@ -11345,6 +11408,35 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
         }
+    }
+    if (j->req.prewarm) {
+        /* Prewarm ends here: the canonical prompt is restored/prefilled and
+         * every qualifying anchor (chain, cold, continued) is on disk, but no
+         * token is generated -- prefill computation above is byte-identical to
+         * a normal request, so greedy identity is unaffected. */
+        const double wall_ms = (now_sec() - t0) * 1000.0;
+        s->act_prewarm_requests++;
+        char body[192];
+        snprintf(body, sizeof(body),
+                 "{\"restored_tokens\":%d,\"prefilled_tokens\":%d,"
+                 "\"anchors_stored\":%d,\"wall_ms\":%.1f}",
+                 cached,
+                 prompt_tokens > cached ? prompt_tokens - cached : 0,
+                 slot->req_anchors_stored,
+                 wall_ms);
+        http_response(j->fd, s->enable_cors, 200, "application/json", body);
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: prewarm ctx=%s restored=%d prefilled=%d anchors=%d wall=%.1f ms",
+                   ctx_span, cached,
+                   prompt_tokens > cached ? prompt_tokens - cached : 0,
+                   slot->req_anchors_stored, wall_ms);
+        trace_event(s, trace_id,
+                    "prewarm done restored=%d prefilled=%d anchors=%d wall=%.1f ms",
+                    cached,
+                    prompt_tokens > cached ? prompt_tokens - cached : 0,
+                    slot->req_anchors_stored, wall_ms);
+        ds4_tokens_free(&effective_prompt);
+        return;
     }
     const uint64_t response_seq = server_next_sequence(s);
     char id[96];
@@ -12248,7 +12340,13 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        pthread_mutex_lock(&s->mu);
+        s->active_jobs++;
+        pthread_mutex_unlock(&s->mu);
         generate_job(s, &s->slots[0], j);
+        pthread_mutex_lock(&s->mu);
+        s->active_jobs--;
+        pthread_mutex_unlock(&s->mu);
         slot_activity_reset(&s->slots[0]);
         pthread_mutex_lock(&j->mu);
         j->done = true;
@@ -12272,9 +12370,13 @@ static void *slot_worker_main(void *arg) {
         }
         job *j = slot->assigned;
         slot->assigned = NULL;
+        s->active_jobs++;
         pthread_mutex_unlock(&s->mu);
 
         generate_job(s, slot, j);
+        pthread_mutex_lock(&s->mu);
+        s->active_jobs--;
+        pthread_mutex_unlock(&s->mu);
         slot_activity_reset(slot);
         pthread_mutex_lock(&j->mu);
         j->done = true;
@@ -12534,7 +12636,32 @@ static bool send_capabilities(server *s, int fd) {
             ds4_gpu_stream_expert_cache_configured_count());
     }
 #endif
-    buf_puts(&b, "},\"kv_disk_store\":{");
+    buf_puts(&b, "}");
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Task-22 direct-I/O observability: whether tier-2 O_DIRECT streaming is
+     * actually engaged right now, plus the fallback history that would
+     * otherwise be invisible (an EINVAL/EFAULT/ENOTSUP permanently disables
+     * direct I/O for the process). Consumer-facing: the console shows
+     * degraded I/O from this object. CUDA-only, same guard as expert_cache. */
+    {
+        uint64_t fb_einval = 0, fb_efault = 0, fb_enotsup = 0, fb_other = 0;
+        uint64_t widened = 0, wasted = 0;
+        ds4_gpu_direct_io_counters(&fb_einval, &fb_efault, &fb_enotsup,
+                                   &fb_other, &widened, &wasted);
+        const int st = ds4_gpu_direct_io_state();
+        buf_printf(&b,
+            ",\"direct_io\":{\"state\":\"%s\",\"disable_errno\":%d,"
+            "\"fallbacks\":{\"einval\":%llu,\"efault\":%llu,"
+            "\"enotsup\":%llu,\"other\":%llu},"
+            "\"widened_reads\":%llu,\"widen_wasted_bytes\":%llu}",
+            st == 1 ? "engaged" : st == 2 ? "disabled" : "unavailable",
+            ds4_gpu_direct_io_disable_errno(),
+            (unsigned long long)fb_einval, (unsigned long long)fb_efault,
+            (unsigned long long)fb_enotsup, (unsigned long long)fb_other,
+            (unsigned long long)widened, (unsigned long long)wasted);
+    }
+#endif
+    buf_puts(&b, ",\"kv_disk_store\":{");
     pthread_mutex_lock(&s->kv_mu);
     buf_printf(&b,
         "\"enabled\":%s,\"budget_bytes\":%llu,"
@@ -12569,6 +12696,215 @@ static bool send_capabilities(server *s, int fd) {
         c->mtp_draft_tokens,
         c->dspark ? "true" : "false");
 
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* GET /v1/routing-stats (also /routing-stats): task#28 per-(layer,expert)
+ * routing-traffic telemetry.  Everything here is computed at request time
+ * from the ds4_routing_stats counter arrays (~740KB scan + one qsort of at
+ * most 30720 keys) -- no GPU work, no hot-path locks; counter reads are
+ * lock-free and may be a beat stale, matching the /v1/activity convention.
+ * Includes the cache-budget advisor v0: estimated_hit_rate_static is the
+ * static popularity-skew approximation (hit rate if the cache held the
+ * top-K experts by lifetime frequency); it ignores temporal locality, so
+ * it is a floor-ish estimate, not locality_sim.  Top-N via env
+ * DS4_ROUTING_TOPN (default 20; the HTTP parser strips query strings). */
+typedef struct {
+    uint64_t sel;
+    uint32_t key;
+} routing_stats_key;
+
+static int routing_stats_key_cmp_desc(const void *pa, const void *pb) {
+    const routing_stats_key *a = pa, *b = pb;
+    if (a->sel != b->sel) return a->sel > b->sel ? -1 : 1;
+    return a->key < b->key ? -1 : a->key > b->key ? 1 : 0;
+}
+
+static bool send_routing_stats(server *s, int fd) {
+    ds4_routing_stats_view v;
+    ds4_routing_stats_get_view(&v);
+    buf b = {0};
+
+    if (!v.enabled) {
+        buf_puts(&b, "{\"schema_version\":1,\"enabled\":false,"
+                     "\"note\":\"DS4_ROUTING_COUNTERS=0\"}\n");
+        bool ok = http_response(fd, s->enable_cors, 200, "application/json",
+                                b.ptr);
+        buf_free(&b);
+        return ok;
+    }
+
+    const uint32_t nkeys = v.n_layer * v.n_expert;
+    routing_stats_key *keys = xmalloc((size_t)nkeys * sizeof(*keys));
+    uint32_t distinct = 0;
+    uint64_t total_sel = 0, total_hit = 0, total_miss = 0;
+    for (uint32_t k = 0; k < nkeys; k++) {
+        const uint64_t sel = v.sel[k];
+        keys[k].sel = sel;
+        keys[k].key = k;
+        if (sel) distinct++;
+        total_sel += sel;
+        total_hit += v.hit[k];
+        total_miss += v.miss[k];
+    }
+    qsort(keys, nkeys, sizeof(*keys), routing_stats_key_cmp_desc);
+    const uint64_t lookups = total_hit + total_miss;
+
+    buf_printf(&b,
+        "{\"schema_version\":1,\"enabled\":true,"
+        "\"key_form\":\"layer_expert_u16\","
+        "\"note\":\"lock-free snapshot; counters cumulative across restarts "
+        "via the persisted file\","
+        "\"totals\":{\"selections\":%llu,\"decode_tokens\":%llu,"
+        "\"prefill_tokens\":%llu,\"distinct_keys\":%u,"
+        "\"lookups\":%llu,\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f},",
+        (unsigned long long)total_sel,
+        (unsigned long long)v.decode_tokens,
+        (unsigned long long)v.prefill_tokens,
+        distinct,
+        (unsigned long long)lookups,
+        (unsigned long long)total_hit,
+        (unsigned long long)total_miss,
+        lookups ? (double)total_hit / (double)lookups : 0.0);
+
+    buf_puts(&b, "\"persistence\":{");
+    if (v.persist_path) {
+        buf_puts(&b, "\"active\":true,\"path\":");
+        json_escape(&b, v.persist_path);
+        buf_printf(&b, ",\"merged_prior_state\":%s,\"flushes\":%llu},",
+                   v.persist_loaded ? "true" : "false",
+                   (unsigned long long)v.flushes);
+    } else {
+        buf_puts(&b, "\"active\":false},");
+    }
+
+    /* Hottest experts.  DS4_ROUTING_TOPN, default 20. */
+    int topn = 20;
+    {
+        const char *e = getenv("DS4_ROUTING_TOPN");
+        if (e && e[0]) topn = atoi(e);
+        if (topn < 1) topn = 1;
+        if (topn > 200) topn = 200;
+    }
+    buf_puts(&b, "\"top_experts\":[");
+    for (int i = 0; i < topn && (uint32_t)i < nkeys && keys[i].sel; i++) {
+        const uint32_t k = keys[i].key;
+        const uint32_t layer = k / v.n_expert, expert = k % v.n_expert;
+        const uint64_t kh = v.hit[k], km = v.miss[k];
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b,
+            "{\"layer\":%u,\"expert\":%u,\"selections\":%llu,"
+            "\"share\":%.5f,\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f}",
+            layer, expert, (unsigned long long)keys[i].sel,
+            total_sel ? (double)keys[i].sel / (double)total_sel : 0.0,
+            (unsigned long long)kh, (unsigned long long)km,
+            (kh + km) ? (double)kh / (double)(kh + km) : 0.0);
+    }
+    buf_puts(&b, "],");
+
+    /* Per-layer aggregates: selections, unique experts, Shannon entropy of
+     * the layer's selection distribution (nats), plus the router-entropy
+     * event counters. */
+    buf_puts(&b, "\"per_layer\":[");
+    bool first_layer = true;
+    for (uint32_t l = 0; l < v.n_layer; l++) {
+        uint64_t lsel = 0;
+        uint32_t uniq = 0;
+        for (uint32_t e = 0; e < v.n_expert; e++) {
+            const uint64_t c = v.sel[l * v.n_expert + e];
+            lsel += c;
+            if (c) uniq++;
+        }
+        if (!lsel) continue;
+        double h = 0.0;
+        for (uint32_t e = 0; e < v.n_expert; e++) {
+            const uint64_t c = v.sel[l * v.n_expert + e];
+            if (!c) continue;
+            const double p = (double)c / (double)lsel;
+            h -= p * log(p);
+        }
+        if (!first_layer) buf_putc(&b, ',');
+        first_layer = false;
+        buf_printf(&b,
+            "{\"layer\":%u,\"selections\":%llu,\"unique_experts\":%u,"
+            "\"selection_entropy_nats\":%.4f,\"entropy_max_nats\":%.4f,"
+            "\"high_entropy_tokens\":%llu,\"entropy_measured_tokens\":%llu}",
+            l, (unsigned long long)lsel, uniq, h,
+            uniq > 1 ? log((double)uniq) : 0.0,
+            (unsigned long long)v.entropy_high[l],
+            (unsigned long long)v.entropy_measured[l]);
+    }
+    buf_puts(&b, "],");
+
+    buf_printf(&b,
+        "\"router_entropy\":{\"enabled\":%s,\"tau_nats\":%.4f,"
+        "\"note\":\"counted only where router scores are host-resident "
+        "(CPU-router decode path); GLM GPU-router probs readback is a "
+        "documented v1 hook\"},",
+        v.entropy_tau >= 0.0 ? "true" : "false",
+        v.entropy_tau >= 0.0 ? v.entropy_tau : -1.0);
+
+    /* Coverage curve: what fraction of all selections the hottest 10/25/50
+     * percent of DISTINCT keys serve -- the popularity-skew figures
+     * previously derived offline from DS4_ROUTING_TRACE captures. */
+    buf_puts(&b, "\"coverage\":[");
+    {
+        const double fracs[] = {0.10, 0.25, 0.50};
+        for (int fi = 0; fi < 3; fi++) {
+            uint32_t upto = (uint32_t)((double)distinct * fracs[fi] + 0.5);
+            if (upto > distinct) upto = distinct;
+            uint64_t covered = 0;
+            for (uint32_t i = 0; i < upto; i++) covered += keys[i].sel;
+            if (fi) buf_putc(&b, ',');
+            buf_printf(&b,
+                "{\"top_key_fraction\":%.2f,\"keys\":%u,"
+                "\"selection_share\":%.4f}",
+                fracs[fi], upto,
+                total_sel ? (double)covered / (double)total_sel : 0.0);
+        }
+    }
+    buf_puts(&b, "]");
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Cache-budget advisor v0 (CUDA builds; needs the slab expert-byte size
+     * the engine planned).  For each candidate budget: K = budget /
+     * expert_bytes cacheable experts; estimated_hit_rate_static = share of
+     * all selections served by the top-K keys by frequency. */
+    {
+        const uint64_t expert_bytes =
+            ds4_gpu_stream_expert_cache_expert_bytes_configured();
+        if (expert_bytes > 0 && total_sel > 0) {
+            const double budgets_gib[] = {50.0, 55.0, 60.0, 63.6, 70.0};
+            buf_printf(&b,
+                ",\"advisor\":{\"expert_bytes\":%llu,"
+                "\"note\":\"static popularity-skew approximation: hit rate "
+                "if the cache held the top-K experts by lifetime frequency; "
+                "ignores temporal locality (locality_sim is the offline "
+                "reference)\",\"budgets\":[",
+                (unsigned long long)expert_bytes);
+            for (int bi = 0; bi < 5; bi++) {
+                const uint64_t budget_bytes =
+                    (uint64_t)(budgets_gib[bi] * 1073741824.0);
+                uint64_t kk = budget_bytes / expert_bytes;
+                if (kk > nkeys) kk = nkeys;
+                uint64_t covered = 0;
+                for (uint64_t i = 0; i < kk; i++) covered += keys[i].sel;
+                if (bi) buf_putc(&b, ',');
+                buf_printf(&b,
+                    "{\"budget_gib\":%.1f,\"cache_experts\":%llu,"
+                    "\"estimated_hit_rate_static\":%.4f}",
+                    budgets_gib[bi], (unsigned long long)kk,
+                    (double)covered / (double)total_sel);
+            }
+            buf_puts(&b, "]}");
+        }
+    }
+#endif
+
+    buf_puts(&b, "}\n");
+    free(keys);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -12620,11 +12956,22 @@ static bool send_activity(server *s, int fd) {
         (unsigned long long)ds4_gpu_stream_expert_cache_counted_bytes(),
         ds4_gpu_stream_expert_cache_current_count());
 #endif
+    buf_puts(&b, "}");
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Task-22: live direct-I/O state (O(1) counter read, CUDA-only). */
+    {
+        const int dio = ds4_gpu_direct_io_state();
+        buf_printf(&b, ",\"direct_io\":{\"state\":\"%s\"}",
+                   dio == 1 ? "engaged" : dio == 2 ? "disabled" : "unavailable");
+    }
+#endif
     buf_printf(&b,
-        "},\"kv_events\":{\"stores\":%llu,\"restores\":%llu,"
+        ",\"kv_events\":{\"stores\":%llu,\"chain_stores\":%llu,"
+        "\"prewarm_requests\":%llu,\"restores\":%llu,"
         "\"restored_tokens_total\":%llu,\"last_restore_tokens\":%d,"
         "\"last_restore_ms\":%.1f}}\n",
-        s->act_kv_stores, s->act_kv_restores, s->act_kv_restored_tokens,
+        s->act_kv_stores, s->act_kv_chain_stores, s->act_prewarm_requests,
+        s->act_kv_restores, s->act_kv_restored_tokens,
         s->act_kv_last_restore_tokens, s->act_kv_last_restore_ms);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -12728,6 +13075,14 @@ static void *client_main(void *arg) {
         goto done;
     }
     if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/v1/routing-stats") ||
+         !strcmp(hr.path, "/routing-stats")))
+    {
+        send_routing_stats(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
         (!strcmp(hr.path, "/") || !strcmp(hr.path, "/console")))
     {
         send_console(s, fd);
@@ -12749,7 +13104,49 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = s->ctx_size;
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/prewarm")) {
+        /* POST /v1/prewarm: body is a standard messages request in either
+         * dialect.  Canonicalization must match the dialect the real requests
+         * will use, so sniff Anthropic-shaped bodies (top-level system string /
+         * anthropic_version) first and fall back to the other parser if the
+         * preferred one rejects the body. */
+        pthread_mutex_lock(&s->mu);
+        /* Fully idle only: with batched slots a prewarm sharing the engine
+         * with an active generation would run on the mixed (128-token)
+         * quantum and crawl; idle-priority means the whole idle quantum path
+         * or nothing. */
+        const bool busy = s->head != NULL || s->active_jobs > 0;
+        pthread_mutex_unlock(&s->mu);
+        if (busy) {
+            /* Prewarm is idle-priority: refuse rather than queue behind
+             * interactive generation.  When it does run, no generation is
+             * active, so prefill uses the existing idle quantum path. */
+            http_error(fd, s->enable_cors, 503,
+                       "prewarm refused: server busy (idle-priority operation)");
+            http_request_free(&hr);
+            goto done;
+        }
+        const bool anthropic_shaped =
+            (hr.body && (strstr(hr.body, "\"anthropic_version\"") ||
+                         strstr(hr.body, "\"system\":"))) ? true : false;
+        if (anthropic_shaped) {
+            ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
+                                         ctx_size, &req, err, sizeof(err));
+            if (!ok) ok = parse_chat_request(s->engine, s, hr.body,
+                                             s->default_tokens, ctx_size, &req,
+                                             err, sizeof(err));
+        } else {
+            ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
+                                    ctx_size, &req, err, sizeof(err));
+            if (!ok) ok = parse_anthropic_request(s->engine, s, hr.body,
+                                                  s->default_tokens, ctx_size,
+                                                  &req, err, sizeof(err));
+        }
+        if (ok) {
+            req.prewarm = true;
+            req.stream = false;
+        }
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
@@ -13312,6 +13709,10 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     ds4_engine_capabilities(engine, &s.caps);
+    /* task#28: load+merge persisted routing counters for this model and
+     * start the periodic flush contract (model-keyed file so multi-model
+     * boxes don't mix; DS4_ROUTING_COUNTERS=0 makes this a no-op). */
+    ds4_routing_stats_init(s.caps.model_name, s.caps.file_bytes);
     {
         const ds4_context_memory cm =
             ds4_context_memory_estimate_with_prefill_mode(

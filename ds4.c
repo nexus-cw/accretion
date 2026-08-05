@@ -43,6 +43,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_tp.h"
+#include "ds4_routing_stats.h"  /* task#28 routing-traffic counters */
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
  * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
@@ -3001,6 +3002,19 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         }
         if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
                                               span_offsets, span_sizes, span_count)) {
+            continue;
+        }
+        /* Task-22 piece 2 (DS4_EMBD_MMAP=1, default OFF): leave the token
+         * embedding table out of the resident device spans; the CUDA embed
+         * path serves the rows from the read-only host mapping instead
+         * (see cuda_model_range_ptr). Saves ~1 GiB of residency. */
+        if (getenv("DS4_EMBD_MMAP") != NULL &&
+            t->name.len == strlen("token_embd.weight") &&
+            memcmp(t->name.ptr, "token_embd.weight", t->name.len) == 0) {
+            fprintf(stderr,
+                    "ds4: DS4_EMBD_MMAP=1: token_embd.weight (%.2f MiB) left "
+                    "unprepared, served from the host model mapping\n",
+                    (double)t->bytes / 1048576.0);
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
@@ -21748,6 +21762,12 @@ static bool metal_graph_decode_cpu_router(
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         selected_i32[i] = (int32_t)selected[i];
     }
+    /* task#28: router-entropy event counter.  This is the one decode path
+     * where the full router score vector is host-resident (just computed
+     * above), so the entropy compare is effectively free here.  The GLM
+     * GPU-router path keeps probs on device; its opt-in readback is a
+     * documented v1 (ROUTING_TELEMETRY.md). */
+    ds4_routing_stats_note_probs(il, probs, DS4_N_EXPERT);
     const double t_cpu = profile ? now_sec() : 0.0;
 
     if (ds4_gpu_tensor_write(metal_graph_router_logits(g),
