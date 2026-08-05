@@ -8,3 +8,19 @@ The sorting rule for every change:
 Structure additive over invasive: platform code wraps and drives the engine rather than patching through it, so tracking upstream stays mechanical.
 
 Engine fixes are upstream-first. If we need a fix before it lands upstream, it goes on the nexus-cw/ds4 `platform` branch and returns here via `scripts/sync-engine.sh`.
+
+
+## Policy tightening (operator, 2026-08-05)
+
+Upstream contribution narrows to IMPORTANT items only:
+- correctness bugs we discover (upstream users deserve them), and
+- changes that reduce OUR rebase burden while we still track upstream.
+
+No more nice-to-have proposals (observability conveniences, optimization
+suggestions). Rationale: upstream is churning fast (mxfp4 merge era), open PRs
+accrue rebase debt weekly, and the expected trajectory is our own stack
+(wakestone) supporting mutable expert populations — effort spent upstreaming
+peripherals is taken from that. Already-filed artifacts ride to conclusion.
+The upstream-watch digest (robo-dog ~/log/ds4-upstream-digest.log, written by
+the 6-hourly sync cron) is the cheap way any session answers "did anything
+move upstream."
