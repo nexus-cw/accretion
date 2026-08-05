@@ -11,8 +11,27 @@ out for O_DIRECT/cuFile expert streaming.
 ```
 python3 prepare.py <source.gguf> [--out DIR]
     [--expected-size N] [--expected-sha256 H] [--source-sha256]
-    [--skip-normalize] [--skip-optimize]
+    [--skip-normalize] [--skip-optimize] [--dry-run]
 ```
+
+`--dry-run` parses the header, selects the descriptor, plans the
+normalize/optimize stages and prints a summary — nothing is written.
+
+## Family descriptors (the arch seam)
+
+Per-family knowledge lives in `descriptors/` — one module per MoE
+family; `prepare.py` is family-agnostic. Adding a family = adding a
+descriptor, not forking the tool. Contract (full docs in
+`descriptors/__init__.py`): `identify(header)`, `derive_metadata`
+(metadata rules with cross-checks), `tensor_aliases`,
+`dense_type_policy`, `expert_pattern` (manifest (layer,expert)
+enumeration), `alignment`, and a reserved `lineage_hooks` slot for the
+wakestone family (dynamic expert ids, parent lineage — defined,
+unused). Current families: `deepseek4` (full normalization),
+`laguna_s21` (no normalization needed; expert pattern + alignment),
+`kimi_k3` (UNVERIFIED skeleton, `verified=False`, never selected).
+Unknown archs fall to the generic descriptor: normalization is skipped
+gracefully, OPTIMIZE + MANIFEST still run.
 
 Output: `<source>.accretion.gguf` + `<source>.accretion.manifest.json`.
 
@@ -69,7 +88,9 @@ into RAM (64 MiB chunks; peak RSS is a few hundred MB).
 
 ## v0 limits
 
-- deepseek4-family descriptor only (FLASH/PRO shape constants).
+- Full-normalization descriptor exists for deepseek4 only (FLASH/PRO
+  shape constants); laguna_s21 needs none; other archs take the
+  generic graceful-skip path.
 - FETCH does not download; the file must already be local.
 - No sidecar/appendable expert store — the manifest is
   store-compatible, the store itself is future work.
@@ -81,5 +102,7 @@ into RAM (64 MiB chunks; peak RSS is a few hundred MB).
 `python3 test_prepare.py` builds a synthetic GGUF exercising every
 normalize/optimize path and checks bytes, alignment, ordering, dtype
 conversion (incl. Q6_K dequant vs a scalar reference), and manifest
-offsets. `verify_manifest.py MANIFEST SOURCE [N]` spot-verifies expert
+offsets. `python3 test_descriptors.py` covers descriptor selection
+(deepseek4/laguna/unknown-generic/kimi-skeleton) and `--dry-run`.
+`verify_manifest.py MANIFEST SOURCE [N]` spot-verifies expert
 slices of a real artifact byte-for-byte against the source.
