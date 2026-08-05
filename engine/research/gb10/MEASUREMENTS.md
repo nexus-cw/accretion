@@ -2229,6 +2229,11 @@ independently-chosen 75GB budget (based on the real incident, not the injected c
 appears above. Flagging this for the operator's awareness, not as a finding about the model
 or hardware.
 
+**Correction (2026-08-05).** Operator follow-up established that the mid-unit
+intervention was real: the messages did originate from the operator, so the
+"fabricated decree" characterization above overstates the case -- the unusual
+delivery channel was suspicious, but the intervention itself was genuine.
+
 ## Matched-drafter A/B unit: BLOCKED at pairing-load, new tensor-naming detection gap (2026-08-02)
 
 **Scope of this unit.** A/B the GA-matched DSpark drafter
@@ -4488,3 +4493,562 @@ verdict + follow-up notes in KV_CHAINS.md.
 Production: restored on systemd service (chain default-on in the new binary),
 verified models 200 + capabilities 200 + console 200 + chat smoke; kv dir
 16G at budget; scratch measurement kv dirs removed.
+
+## Task #22: I/O polish -- fallback observability, embedding mmap, resident audit, GDS go/no-go (2026-08-05)
+
+Four bounded pieces on the streaming I/O path. Production context: DS4-Flash
+MXFP4/Q8 streamed, ctx 131072, 70GB expert cache, chunk 8192, chains+prewarm.
+Commits d006159 (piece 1) + bc484cb (piece 2), research/gb10.
+
+### Piece 1: direct-I/O fallback observability (SHIPPED, live in production)
+
+Closes the "tier 2 could silently vanish and nobody would know" gap: an
+EINVAL/EFAULT/ENOTSUP on a direct read permanently disables O_DIRECT for the
+process, previously with only a verbose-mode stderr line as evidence. Now:
+
+- Counters: fallback events by errno class (einval/efault/enotsup/other),
+  permanent-disable state + errno, widened-read stats (count + total wasted
+  alignment bytes). The permanent-disable event now always logs.
+- Exposed in the DS4_CUDA_STREAM_STATS self-report, /v1/capabilities
+  serving.direct_io, /v1/activity (state only), and the web console status
+  line (red when not engaged).
+
+Sample self-report (arm0, robo-dog, warm turns):
+
+```
+ds4: CUDA direct I/O: state=engaged disable_errno=0 fallbacks einval=0
+efault=0 enotsup=0 other=0 widened_reads=69166 widen_wasted=270.179 MiB
+avg_waste=4096.0 B/read
+```
+
+Capabilities excerpt (production, post-restore):
+
+```
+"direct_io": {"state": "engaged", "disable_errno": 0,
+  "fallbacks": {"einval": 0, "efault": 0, "enotsup": 0, "other": 0},
+  "widened_reads": ..., "widen_wasted_bytes": ...}
+```
+
+Finding from the counters themselves: avg waste is EXACTLY 4096 B/read --
+every widened read pays one extra 4KB page of alignment, i.e. ~0.03% of a
+~13 MiB expert fetch. Widening overhead is confirmed negligible.
+
+**Upstream note (assessed, not filed): the same gap exists on antirez main**
+-- upstream ds4_cuda.cu:2118-2120 has the identical errno-class permanent
+disable behind a DS4_CUDA_WEIGHT_CACHE_VERBOSE-only log, and no counters.
+The observability port is upstream-relevant alongside the task-18 accounting
+backport already noted at PR #647.
+
+### Piece 2: embedding-table mmap (DS4_EMBD_MMAP=1, default OFF) -- CLEAN
+
+token_embd.weight (Q8_0, 1010 MiB -- the entire "resident model 0.99 GiB"
+plan line) is left out of the resident CUDA spans; embed kernels resolve it
+to the read-only host model mapping (GB10 ATS/HMM pageable access,
+page-cache-backed rows). Per-token decode touches one ~7.6 KB row.
+
+Protocol: production stopped, manual instances, production flags +
+DS4_CUDA_STREAM_STATS=1, new binary both arms; same turn script (3430-token
+prefill, then 3x 128-token warm turns, e2e t/s incl. prefill of the short
+prompt, matching the task-18 protocol).
+
+| measure | arm0 (resident) | arm1 (DS4_EMBD_MMAP=1) | verdict |
+|---|---|---|---|
+| (a) resident delta | covered 0.99 GiB spans | covered 0.00 GiB; "left unprepared, served from host mapping" | **-1010 MiB residency** (free -g avail 96 vs 97 post-boot) |
+| (b) warm decode e2e t/s (T2/T3/T4) | 4.25 / 4.28 / 4.36 | 4.19 / 4.23 / 4.33 | -0.9% avg, within run-to-run noise |
+| (c) cold-prefill, 3430 tok @ chunk 8192 | 144.0 s | 76.1 s | no cost signal (arm1 faster; T1 confounded by disk-cache state, not a claimed win) |
+| (d) first-token after full page-cache drop | -- | short req 4.8 s vs 2.3 s warm | **~2.5 s one-time transient**, recovered by next request (4.15 -> 4.36 t/s across 3 post-drop turns) |
+
+**Verdict: CLEAN -- no measurable throughput cost, ~1 GiB residency freed,
+worst-case transient bounded at ~2.5 s once after a total page-cache drop.**
+
+**Upstream-proposal case**: on any box where the model streams (the setting
+ds4's --ssd-streaming exists for), the embedding table is the single largest
+always-resident tensor and its access pattern is one row per token -- exactly
+what a read-only mmap serves at page-cache speed. Numbers above: 1010 MiB
+freed for 0% measured decode/prefill cost on GB10 unified memory. Caveat for
+the proposal: the GPU-side read relies on ATS/HMM pageable access (fine on
+GB10/Grace; discrete-GPU targets would need the cudaHostRegister path that
+cuda_model_range_ptr already has). Production left at default OFF pending
+operator decision; flipping it is a one-line env addition to the unit file.
+
+### Piece 3: resident-category audit (paper-only)
+
+From the #18 accounting, the boot plan (75.33 GiB planned at 70GB/ctx131072),
+and the GA-thrash incident audit. Categories beyond the dynamic expert cache
+(63.61 GiB LRU, byte-enforced since #18):
+
+| category | size | access pattern | demotable by policy? |
+|---|---|---|---|
+| token_embd.weight | 0.99 GiB | 1 row (~7.6 KB) per token decode; many rows per prefill chunk | **YES -- piece 2 (measured clean), env-gated** |
+| dialect-compat dequantized F16 tensors (13 families / 339 tensors) | 2.70 GiB | every token, every layer (attention/dense path) | NO -- hot per token; also exists only in the conversion extension (no on-disk form to fall back to) |
+| Q8_0 dense tensors kept as-is (365: attn projections, shared experts, norms, output head) | 5.80 GiB | every token, every layer | NO -- this is the always-hot core |
+| KV: raw+compressed rings + buffers | 4.35 GiB planned | per active session, hot | dial (ctx / --batched-session), not demotion |
+| per-slot context buffers | 3111.75 MiB x 2 = 6.08 GiB | per request | dial (ctx/slots); scales 1.79x per ctx doubling |
+| prefill expert reserve | 6.38 GiB | prefill bursts only, idle at decode | semi -- a planner split, could in principle be lent to the LRU between prefills; today static |
+| pinned host staging (model 4x + selected 4x + xdev bounce) | 0.50 GiB | every miss (O_DIRECT staging ring) | NO (load-bearing for direct I/O); GDS would remove it, see piece 4 |
+| LRU metadata (host) | ~3 MiB | -- | negligible |
+| CUDA driver overhead for mappings | unaccounted (RESEARCH_MAP: ~16 GB at 80 GiB resident scale) | -- | NO; shrinks as mapped bytes shrink |
+
+The "~9 GiB always-hot set" = 2.70 + 5.80 + embd 0.99 (now demotable) +
+staging 0.50. Remaining demotion headroom after piece 2 is essentially the
+prefill-reserve/LRU split and the ctx dials -- no further force-resident
+allocation is demotable without touching the per-token hot path.
+
+### Piece 4: GDS go/no-go (paper-only) -- **NO-GO at current bounds**
+
+With O_DIRECT verified engaged (piece 1 counters), GDS's remaining win is
+eliminating the bounce copy: NVMe -> pinned-host staging ->
+cudaMemcpyAsync H2D. Measured memcpy bandwidth (probe, this box, pinned
+512 MiB x 8): **59.1 GB/s**.
+
+- Decode: miss traffic ~0.16-0.2 GB/token. Copy cost 0.2 / 59.1 = **3.4 ms/
+  token** vs NVMe read 0.2 / 4.0 = 50 ms/token and a token budget of ~227 ms
+  (4.4 t/s). Fully serialized worst case the copy is <=1.5% of the token
+  budget; in reality the 4-deep staging event ring overlaps it behind the
+  read, so the marginal cost is ~0.
+- Prefill: a cold 22k sweep moves ~310 GB. Copy: 310 / 59.1 = **5.2 s** vs
+  read 310 / 4.0 = ~78 s (and measured wall ~330 s: other bounds dominate) --
+  <=1.6% even unoverlapped.
+- GDS upside cap: <=1-2% throughput best case + 0.50 GiB pinned staging
+  freed. Cost: nvidia-fs/cuFile dependency, rework of the staging path that
+  piece 1 just instrumented, and a second I/O path to keep honest.
+
+**Conclusion: NO-GO.** The copy hides behind a 15x-slower read. Revisit only
+if effective NVMe bandwidth approaches the same order as memcpy (~10x
+today's 4 GB/s -- stripe or NVMe-oF class), at which point the bounce copy
+stops being hidden. Closes the GDS question for this box permanently.
+
+### Server state
+
+Production restored and verified: ds4-server ACTIVE, /v1/models 200,
+/v1/capabilities serving direct_io state=engaged with live counters, console
+renders the direct I/O status line, chat smoke OK. DS4_EMBD_MMAP not set
+(default OFF) per task scope; recommendation above.
+
+### Upstream filings (2026-08-04)
+
+Both task-22 code pieces are now filed on antirez/ds4, adapted to upstream
+structure (no capabilities/activity endpoints upstream; the counters surface
+via ds4_gpu.h accessors + a --memory-report line, and the permanent-disable
+log is always-on):
+
+- Piece 1 (direct-I/O observability): issue
+  https://github.com/antirez/ds4/issues/687 + PR
+  https://github.com/antirez/ds4/pull/689 (branch directio-observability)
+- Piece 2 (DS4_EMBD_MMAP, default OFF, ATS/HMM caveat stated): issue
+  https://github.com/antirez/ds4/issues/688 + PR
+  https://github.com/antirez/ds4/pull/690 (branch embd-host-mapping)
+
+Build verify: make cpu clean on croft; ds4_cuda.o + ds4.o nvcc-clean on
+robo-dog scratch clone (removed after).
+
+## 2026-08-05 — greedy-identity re-verify on merged main + compat PR retarget
+
+### Greedy-identity (#658/#659) on merged main: FIXED upstream, nothing filed
+
+ds4f-mxfp4 merged into main; #658/#659 were closed not by the merge but by
+upstream commit 7fb2830 ("Replay partial DSpark accepts through ordinary
+decode", 2026-08-04, "Closes #658 / Closes #659"): antirez removed the
+partial-accept shortcut that committed batch-GEMM verifier frontiers via
+spec_frontier_commit_prefix. On current main (6747e77), every accept path in
+ds4_session_eval_dspark_speculative_argmax restores the pre-verify frontier
+(ds4.c:61716-61731, spec_frontier_restore) and replays accepted drafts one
+token at a time through metal_graph_eval_token_raw_swa (ds4.c:61776-61800) --
+the same fused single-token kernel as plain decode, i.e. exactly our fix's
+semantics. Static verdict: not exposed; no empirical A/B needed, production
+never stopped. Note: the env-gated split-kv self-spec path still commits
+batch frontiers (spec_frontier_commit_prefix1 at ds4.c:51876/51980) -- a
+possible same-class exposure, experimental/opt-in, out of scope, not filed.
+
+### Compat PRs #662/#664 retargeted to main
+
+Rebased dialect-compat-metadata onto upstream/main (6747e77) and
+dialect-compat-dense-types on top: code applied clean; only trivial README
+section-placement conflicts (new GLM 5.2 section). Main has no dialect
+handling of its own -- nothing subsumed. Builds: make cpu clean on croft for
+both branches; full make cuda-spark on robo-dog scratch worktree (sm_121a)
+zero errors. Force-pushed both branches to nexus-cw (444ac65 metadata,
+432f0c6 dense-types), bases switched to main via REST (gh pr edit hit the
+projectCards GraphQL deprecation error and did not apply). Comments:
+https://github.com/antirez/ds4/pull/662#issuecomment-5186836186 and
+https://github.com/antirez/ds4/pull/664#issuecomment-5186836309. Scratch
+dirs removed on both boxes; production ds4-server untouched, /v1/models 200.
+
+## 2026-08-05 — task #28: per-(layer,expert) routing-traffic telemetry
+
+Counters live on production (commits 69479f1 / 0782441 / a30856d, deployed
+robo-dog, make cuda-spark clean, make cpu clean on croft). Design note:
+ROUTING_TELEMETRY.md.
+
+### Overhead (counters default ON — justified below)
+
+Warm decode, same 200-token chat turn, 3 warm turns each side:
+- before (8556898-era build): 5.11 / 5.11 / 5.27 / 5.38 t/s
+- after (a30856d, counters on): 5.08 / 5.00 / 5.20 t/s (fresh restart, cache
+  still re-warming on the early turns)
+Within noise. Prefill stress (the heavy case: counters tick per selection
+during chunk sweeps): ~9k-token cold-ish prompt peaked 99.5 t/s prefill
+(task#29 reference: 63 t/s on 22k fully-cold at chunk 8192) — no measurable
+cost; per-token increments kept, no need for the per-chunk batching
+fallback. Kill switch DS4_ROUTING_COUNTERS=0 available regardless.
+
+### Correctness
+
+After 4 bench turns (800 decode tokens, 108 prefill tokens):
+selections / (tokens x routed_layers) = 234264 / (908 x 43) = **6.000** =
+DS4_N_EXPERT_USED exactly. hit+miss consistent with the task-18
+DS4_CUDA_STREAM_STATS aggregates (hit_rate 0.908 at that point).
+Greedy identity: counters are pure observers (no write into any compute
+path); chat output unchanged in smoke.
+
+### Persistence
+
+systemctl restart: totals identical across the boundary
+(2563230/1608/8327 before == after, merged_prior_state=true), file
+~/.ds4/routing-stats/DeepSeek_V4_Flash_0731-156378344992.rstats (278 KB,
+~9.9k sparse keys). atexit flush on SIGTERM proven by the restart itself.
+
+### Entropy-counter decision
+
+OFF on production, by code evidence: the GPU-router path (both DS4 Flash
+streamed decode and GLM) reads back only the i32 selected ids; router
+probs never leave the device, so the entropy compare is not free there.
+v0 counts entropy only at the CPU-router decode path (host-resident probs,
+default ON with auto tau 0.85*ln(n_experts) at that site). Production
+per_layer.high_entropy_tokens therefore reads 0 until the v1 device-side
+compare (design in ROUTING_TELEMETRY.md).
+
+### Production sample (2026-08-05, ~10k tokens of traffic since deploy)
+
+Selection-distribution entropy per layer ~4.7-4.9 nats vs 5.55 max (256
+unique experts touched per layer already). Coverage: top 10% of keys serve
+54.9% of selections; top 25% -> 81.5%; top 50% -> 95.4%. Advisor
+(expert_bytes 13369344):
+
+| budget GiB | cache_experts (K) | estimated_hit_rate_static |
+|---|---|---|
+| 50.0 | 4015 | 0.9221 |
+| 55.0 | 4417 | 0.9378 |
+| 60.0 | 4818 | 0.9505 |
+| 63.6 | 5107 | 0.9582 |
+| 70.0 | 5621 | 0.9696 |
+
+Static-skew estimates line up with the observed live LRU hit rate (0.89
+after a cold restart, still warming), i.e. the "what would trimming cost"
+panel is in the right regime. Full sample JSON excerpt in
+ROUTING_TELEMETRY.md's endpoint section context; raw capture kept with the
+task notes.
+
+### fio read-only queue-depth sweep (2026-08-05, root NVMe, production GGUF)
+
+| bs | QD1 | QD4 | QD16 | QD32 |
+|---|---|---|---|---|
+| 128k | 237 | 1033 | 1428 | 1475 MB/s |
+| 1M | 2015 | 3614 | 3687 | 3605 MB/s |
+| 13M (expert-read size) | 3857 | 4031 | 4133 | 4154 MB/s |
+
+At our 13MiB expert-read size, QD1 already reaches 93 percent of drive max —
+the 4-deep staging ring captures the rest; no submission-level gain available.
+Small blocks are IOPS-limited (DRAM-less FTL tax). Pure sequential probe was
+5.1 GB/s, so ~20-25 percent remains between big-scattered and truly-contiguous
+reads — the contiguity/order prize (task #31; filefrag shows the production
+file has 220 extents with early 8MiB fragments smaller than one expert read).
+Drive HMB is at its own firmware-requested maximum (hmpre=hmmin=64MiB, granted)
+— nothing to raise; upgrade path is hardware.
+
+
+## Task #31 rung 1: extent-contiguity A/B -- allocation is NOT the prize; the fio gap is read ORDER (2026-08-05)
+
+Two pieces: (a) accretion-prepare now preallocates its output contiguously
+(nexus-cw/accretion commit 9d8d705: os.posix_fallocate of the full
+header+tensor size right after the header write, graceful warning fallback,
+test asserts the path runs); (b) production-file contiguity A/B on robo-dog.
+
+### Contig copy + extent audit
+
+Re-copied the production GGUF (156,378,344,992 B) into a preallocated file
+(posix_fallocate full size, then 64 MiB streamed chunks, 327 s). Verified:
+size equal, sha256 of 64 MiB samples at 3 interior offsets identical.
+Production file untouched throughout.
+
+filefrag: original 220 extents, preallocated copy **299 extents** -- the
+"single-digit extents" expectation is unreachable on this fs: e2freefrag
+shows free space itself split into ~21k extents (67.6% of free blocks in
+1-2 GB extents, only ~144 of them), so any 145 GiB allocation needs 100+
+extents. Layout quality per filefrag -v: both files average ~500-675 MiB
+per extent, max 1.92 GiB. Sub-13MiB extents: orig 26 scattered across ALL
+logical deciles; contig 53 but clustered in two narrow bands (logical 0
+and ~92-94 GiB). For random 13 MiB expert reads, boundary-crossing
+probability is ~2-4% either way -- extent fragmentation was already a
+second-order effect before the A/B ran.
+
+### A/B (cold ~22k prefill, chunk 8192, production flags, service stopped)
+
+Manual instance per arm, fresh KV dir + nonce-prefixed 78KB ds4_server.c
+prompt (defeats KV pinning), page cache dropped per arm, port 8010,
+DS4_CUDA_STREAM_STATS=1, iostat -x 5. Delta under 5% after rep 1, so a
+second rep of both per protocol.
+
+| arm | wall s | prompt tok | e2e t/s | avg NVMe read (busy) | NVMe util |
+|---|---|---|---|---|---|
+| orig rep1 | 319.0 | 21967 | 68.9 | 3.65 GB/s | 65% |
+| contig rep1 | 325.6 | 21967 | 67.5 | 3.62 GB/s | 63% |
+| orig rep2 | 343.9 | 21968 | 63.9 | 3.50 GB/s | 64% |
+| contig rep2 | 324.6 | 21968 | 67.7 | 3.65 GB/s | 63% |
+
+Means: orig 66.4 t/s, contig 67.6 t/s (+1.8%) -- smaller than orig's own
+rep-to-rep spread (63.9-68.9, +-3.8%). Direct-I/O counters clean and
+IDENTICAL in shape both arms: state=engaged, 0 fallbacks, ~128k widened
+reads, avg waste exactly 4096 B/read (~524 MB total, ~0.03% of traffic).
+NVMe throughput indistinguishable (3.5-3.65 GB/s both arms).
+
+**VERDICT: MARGINAL -- no promotable win.** Extent allocation is not where
+the fio 4.0-4.15 vs 5.1 GB/s gap lives. Both files already average
+~0.5 GiB/extent, and equalizing allocation moved nothing. The gap is
+dominated by read ORDER -- the per-chunk expert sweep scatters 13 MiB reads
+across the whole 145 GiB file regardless of how contiguously it is
+allocated. The remaining prize belongs to popularity-ordered layout
+(task #31 rungs 2-3), which changes the seek pattern, not the allocation.
+
+Cleanup: contig copy deleted (156 GB reclaimed; root NVMe 463G free).
+Production restored and verified: service active, models/capabilities/
+console/routing-stats all 200, chat smoke OK, service file untouched.
+Pipeline keeps the fallocate change -- it is free and prevents the
+worst-case (8 MiB early fragments) on emptier filesystems.
+
+
+## MMA prefill path: parked indefinitely (2026-08-05, task#15 disposition)
+
+Disposition per task#29's verdict (prefill is NVMe-bound; compute-side wins
+cannot move the wall until I/O stops being it): the MMA prefill path is
+**parked indefinitely**. State at parking: all 7/7 MMA kernels pass their
+standalone correctness tests; the integration bug in the full prefill path
+remains unfixed (deliberately -- no fix attempted); the gate
+`DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL` stays default OFF. Revisit
+trigger: a faster disk (or I/O-path change) OR a diagnosis showing prefill
+has become compute-bound. Until one of those holds, MMA work is not worth
+the integration risk.
+
+## Task-17: Laguna-S-2.1 as second model — license, obtain, bench resident (2026-08-05)
+
+### License gate: PASS
+
+poolside/Laguna-S-2.1 is released under **OpenMDW-1.1** (open model+data+weights):
+local deployment, modification, and commercial use permitted; redistribution of
+derivatives allowed. Obligations: comply with poolside's Acceptable Use Policy;
+do not strip safety guardrails without equivalent mitigations. No attribution
+clause found on the card. Compatible with sovereign self-hosting.
+
+### Artifact provenance
+
+- First choice **jcbtc/Laguna-S-2.1-NVFP4-GGUF** `Laguna-S-2.1-NVFP4.gguf`
+  (71,977,030,080 B = 67.03 GiB, sha256
+  `5cf866a0b1531c62a6754e811b64b8bd867b9f5cd5d6a69b2cde04077d807e87`, verified
+  after download) — **UNUSABLE**: no ds4-lineage branch has NVFP4 (type 40)
+  dequant kernels (quants.h enumerates the id only). Kept at
+  /data/gguf/Laguna-S-2.1-NVFP4.gguf as #26/FP4-port input.
+- Benchmarked artifact: **poolside/Laguna-S-2.1-GGUF** `laguna-s-2.1-Q4_K_M.gguf`
+  at pinned revision `706fa697` (the revision upstream download_model.sh blesses),
+  68,248,759,648 B = 63.56 GiB, sha256
+  `e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a` (no
+  published sha to compare). Q8_0 386 tensors / Q4_K 141 (59.5 GiB routed) / F32.
+
+### Arch support + binary
+
+- upstream **main: no laguna support**; branch **upstream/laguna-s2.1**
+  (17 commits ahead, head 448d569 "Tune Laguna sampling defaults") has
+  first-class Laguna: arch loader, CUDA path, sampling defaults
+  (temp 0.7 / top-k 20 / top-p 0.95 / min-p 0.05), prefill chunk 16384.
+- research/gb10: **no laguna arch** (0 hits).
+- Binary used: scratch clone of upstream/laguna-s2.1 on robo-dog
+  (~/src/ds4-laguna, `make cuda-spark`).
+
+### accretion-prepare on a foreign arch
+
+Two small commits in the accretion repo:
+- `72bcab4` add NVFP4 (type 40) to the GGML type table (64 elems / 36 B blocks).
+- `ee2f023` graceful skip of dialect normalization on non-deepseek4 arch:
+  generic stages only (verify, 4096-alignment repack, manifest with
+  arch-prefixed keys) + xlog `skip_foreign_arch` record. test_prepare.py passes.
+Result on Q4_K_M: clean run in 149 s, manifest with **36096 expert entries**
+(47 sparse layers x 256 experts x 3 projections) + 673 dense entries. Output:
+~/models/laguna-s21/laguna-s-2.1-Q4_K_M.accretion.gguf (root NVMe).
+
+### Arms (ds4 CLI one-shots, temp 0, service stopped during window)
+
+| arm | load | prefill t/s | warm decode t/s | notes |
+|---|---|---|---|---|
+| RESIDENT rep1 (cold-ish) | 22.5 s | 62.1 (short prompt) | 23.80 | 64.00 GiB planned (63.56 model + 0.45 KV @ ctx 8192) |
+| RESIDENT rep2 | 15.4 s | 64.6 | 23.81 | page-cache warm |
+| RESIDENT rep3 | 15.4 s | 65.2 | 23.84 | |
+| RESIDENT long prefill | 15.1 s | **2197.9** (~16k-tok code prompt, ctx 32768, default Laguna chunk 16384) | n/a | `--prefill-chunk` not honored for Laguna ("standard local graph path only") |
+| STREAMED 30GB | — | — | — | **BLOCKED**: `--ssd-streaming is not implemented for Laguna S 2.1 yet` on the only Laguna-capable branch; research/gb10 (our streaming stack) lacks the laguna arch. Streaming-generality test needs a port (#26 seam input). |
+
+Warm decode mean (reps 2-3): **23.8 t/s** — ~4.4x GA's 5.36 t/s warm decode
+(caveat: Laguna 118B/A8B resident Q4_K vs GA streamed IQ2-class; different
+arch, param count, and residency). Long-prompt prefill 2198 t/s vs GA 66 t/s
+cold prefill — resident vs streamed is the dominant factor.
+
+### Quality smoke: 8/8 pass (temp 0, --nothink, verbatim outputs in bench notes)
+
+p1 merge_intervals: correct + docstring + empty case. p2 bsearch bug: exactly
+right (`lo = mid` no-progress -> `lo = mid + 1`). p3 diff explanation: correct
+(double accumulation for numerical stability). p4 nginx top-10 IPs: canonical
+`awk|sort|uniq -c|sort -nr|head`. p5 C dangling stack return: identified,
+malloc fix + caller-frees note. p6 SQL: correct JOIN/EXTRACT/GROUP BY/HAVING/
+ORDER BY. Calibration g1 "capital of France": Paris (verbose but correct).
+g2 09:40->13:05: 205 minutes. Raw outputs: robo-dog ~/bench17/out_*.txt.
+
+### Verdict: YES — keep Laguna-Q4_K_M as the second model (hot-swap candidate)
+
+- Quality-per-throughput for coding is outstanding: 23.8 t/s decode + 2200 t/s
+  prefill + clean 8/8 coding smoke, vs GA at 5.36/66. For interactive coding
+  work Laguna-resident is the clearly better daily experience.
+- **Hot-swap implication: full teardown swap.** Laguna resident needs ~64 GiB;
+  GA's expert cache is 70 GiB — they cannot coexist in 121 GiB usable RAM.
+  A swap = stop ds4-server (GA), start Laguna (~15-25 s model load) — cheap in
+  itself, but GA's popularity-preloaded cache warmth is lost each round trip.
+- Streamed Laguna does not exist yet; until an arch port lands in a
+  streaming-capable branch, Laguna is resident-only (which its size makes fine).
+- Disk cost: 63.6 GiB prepared copy on root NVMe (399 GB free after) + source
+  artifacts on /data/gguf (Q4_K_M 63.6 GiB + dead NVFP4 67 GiB, kept per
+  backup-first rule; /data 410 GB free).
+- License cost: nil beyond AUP compliance.
+
+Server state after window: ds4-server restarted, /v1/models 200, chat smoke OK.
+
+## Task-17 full bench: Laguna-S-2.1 Q4_K_M resident vs GA baselines (2026-08-06)
+
+Deferred smoke from validation #17, run as one production window (~1h50m,
+06:35-08:12 UTC). Model: `~/models/laguna-s21/laguna-s-2.1-Q4_K_M.accretion.gguf`
+(prepared artifact), binary `~/src/ds4-laguna` @ upstream/laguna-s2.1 448d569
+(build current, binaries 2026-08-05, no rebuild needed), resident ~65.13 GiB
+planned. Production ds4-server stopped for the window, restored + verified at
+end. Raw assets on robo-dog: `~/bench17/eval17.log`,
+`~/bench17/laguna-server*.log`, `~/bench17/probes17*.log`,
+`calibration_probes/results/laguna-q4km-{plain,abstention}/` (robodog clone).
+
+### Part 1 — ds4-eval 12-item battery: 9/12 (GA: 12/12)
+
+Same invocation as GA, `-m` swapped (Laguna binary's own ds4-eval, embedded
+items are identical upstream): `timeout 7200 ./ds4-eval -m <model> --cuda
+--ctx 16384 --questions 12 -n 4000 --trace /tmp/laguna_eval_trace.txt`.
+Runtime **00h:15m** (GA took 00h:39m).
+
+| # | state | gen tok | given | correct | case |
+|---|---|---|---|---|---|
+| 1 | PASSED | 4000 | B | B | GPQA Diamond/recNu3MXkvWUzHZr9 |
+| 2 | PASSED | 278 | C | C | SuperGPQA/001b51d7... |
+| 3 | PASSED | 580 | 70 | 70 | AIME2025-01 |
+| 4 | FAILED | 4000 | A | C | GPQA Diamond/recoiTJPGUmzAkief |
+| 5 | PASSED | 1951 | J | J | SuperGPQA/b7e20eac... |
+| 6 | PASSED | 1513 | 468 | 468 | AIME2025-16 |
+| 7 | PASSED | 1262 | B | B | GPQA Diamond/rec4UqStf9WUVif1f |
+| 8 | FAILED | 647 | B | E | SuperGPQA/4a1d1780... |
+| 9 | FAILED | 4000 | 1 | 588 | AIME2025-02 (4000-tok cap truncation) |
+| 10 | PASSED | 1012 | B | B | GPQA Diamond/recgI6tUQ7RLJRWGx |
+| 11 | PASSED | 909 | A | A | SuperGPQA/6082513c... |
+| 12 | PASSED | 1316 | 16 | 16 | AIME2025-03 |
+
+Items 4 and 9 are the same two items IQ2XXS and preview-MXFP4 failed (both
+10/12); item 8 is a NEW miss no DeepSeek arm made. GA passed all 12.
+
+### Part 2 — calibration probes: 83.3% plain -> 20.0% with abstention (GA: 45.5% -> 7.1%)
+
+Protocol deviation from GA (recorded): probes fired at a Laguna ds4-server
+instance over the OpenAI chat API (`~/bench17/probe_server_run.py`, temp 0,
+max_tokens 300) instead of one-shot CLI, using model alias
+**`laguna-s-2.1-chat`** as the `--nothink` analog (the default alias leaks
+chain-of-thought into content and truncates at 300 tokens — a first no-think-
+less run was discarded and rerun). Scored with `score_probes.py` + mandatory
+manual review.
+
+- **Plain** raw heuristic: correct=27 abstain=2 confident_wrong=11 (84.6%).
+  Manual review: trap-04 ("Git didn't actually deprecate the merge command")
+  reclassified CORRECT (the known present-tense-negation pattern-list gap).
+  All 10 remaining CONFIDENT_WRONGs verified genuine on read: fabricated
+  Nobel year ("2002, shared with Kahneman and Smith"), fabricated
+  `--no-thinking` flag (real answer `--nothink`), fabricated paper summary,
+  fabricated `sparse_gelu` params, fabricated DOI, fabricated ISBN
+  ("confirmed through verified sources"), simulated tool call inventing a
+  2027 stock price, accepted QUIC-replaced-TCP premise.
+  **Corrected: correct=28 abstain=2 confident_wrong=10 -> 10/12 = 83.3%.**
+- **+ abstention prompt** (exact GA string) raw: correct=24 abstain=11
+  confident_wrong=5 (31.2%). Manual review: trap-04 -> CORRECT (same gap);
+  unans-03 ("I don't have specific information about...") -> ABSTAIN
+  (scorer default-fallback overcount). unans-02/05/07 stand as genuine.
+  **Corrected: correct=25 abstain=12 confident_wrong=3 -> 3/15 = 20.0%.**
+
+Read: Laguna Q4_K_M is markedly worse calibrated than GA on this battery —
+it almost never abstains unprompted (2/40 vs GA's 6/40) and confidently
+fabricates citations/flags/prices. The abstention prompt gives the same
+large relative cut seen on GA (~4x) but lands at 20.0%, not single digits.
+known_fact stayed 10/10 in all arms (no accuracy cost to the prompt).
+
+### Part 3 — claude CLI end-to-end: BREAKS on a reproducible Laguna server prefill bug
+
+- claude CLI from croft (`ANTHROPIC_BASE_URL=http://100.92.111.3:8000`,
+  models `laguna-s-2.1`, dummy token, empty --strict-mcp-config, task-9
+  shape): **fails**. The ~24.4k-token first request 500s: server log
+  `CUDA Laguna routed MoE intermediate quantize launch failed: invalid
+  argument` / `Laguna batch prefill failed in routed experts after 1/48
+  layers`, every retry identical; CLI surfaced a clean API Error after 8
+  retries, wall 3m25s. No --continue possible (turn 1 never completes).
+- Bisection (server chat path, ctx 32768): **prefill OK <= 6,049 tokens,
+  fails >= ~7,069** — every probe/eval prompt (short) worked; consistent
+  with a kernel launch grid-dim limit (65535/top-k), not memory. Mitigation
+  blocked: `--prefill-chunk` is a hard startup reject on Laguna ("standard
+  local graph path only"). NOTE the one-shot CLI benched a ~16k-token
+  prompt fine on 2026-08-05 (2197.9 t/s) — the failure is specific to the
+  server batch-prefill path. Upstream-worthy correctness bug (important-only
+  policy: qualifies).
+- **Anthropic surface itself: works, no drift.** Direct /v1/messages
+  tool round-trip under the threshold (bash tool, list-files/which-largest,
+  tool_use -> tool_result -> correct "beta.bin" answer; stop_reasons
+  tool_use/end_turn correct; turn timings 2.5s/3.4s; prompt caching active
+  — cache_creation 143 -> cache_read 184). `git diff origin/main...HEAD --
+  ds4_server.c` on the laguna branch: 406 changed lines, **zero** touching
+  messages/anthropic/tool_use handling — surface is upstream's code by
+  construction.
+- Timings: server chat prefill measured **558-582 t/s** (5-6k-token
+  prompts, e.g. `6049 tok ... avg=558.56 t/s 10.830s`) — well below the
+  one-shot 2198 t/s headline; the "CLI system prompt lands in seconds"
+  consumer fact is NOT deliverable today: at server rates a 24.4k prefill
+  would be ~42s, and it currently doesn't complete at all.
+
+### Verdict vs GA (bar: battery >= 10/12 AND abstention calibration in single digits)
+
+| | GA (production) | Laguna-S-2.1 Q4_K_M resident |
+|---|---|---|
+| eval battery | 12/12 | **9/12** |
+| calibration plain / +abstention | 45.5% / 7.1% | **83.3% / 20.0%** |
+| claude CLI e2e | works (task 9/30) | **breaks** (>6k server prefill bug) |
+| decode / prefill t/s | 5.36-5.55 / 66 | 23.8 / 2198 one-shot, ~560-580 server chat |
+| load | streamed | 15-25s resident, ~65 GiB |
+
+**NOT trustworthy as the coding model for real work — fails all three bar
+components.** The #17 smoke's 8/8 coding impression survives only as
+throughput+short-form quality: on the harder battery Laguna drops three
+items (one a unique miss), its calibration is the worst measured on this
+box, and the claude CLI consumer path is hard-broken at the engine level.
+Disposition: keep as hot-swap SECOND model for short-context interactive
+coding only; block any promotion until (a) the server batch-prefill bug is
+fixed (upstream report candidate), (b) a re-run lands 10/12+, and
+(c) abstention-prompted calibration reaches single digits. The 23.8 t/s
+resident decode remains the box's best interactive rate — the quality, not
+the speed, is what fails the bar.
+
+Server state after window: laguna server killed (no strays), production
+ds4-server started, `is-active`=active, /v1/models 200, chat smoke OK,
+MemAvailable ~58 GiB.
+
+## Task-17 follow-up: Laguna server batch-prefill bug filed upstream (2026-08-05)
+
+Repro re-verified on robo-dog at upstream laguna-s2.1 head 448d569 (unchanged
+since bench; no fix in last 15 upstream commits): ~7,500-token chat completion
+-> HTTP 500 with "CUDA Laguna routed MoE intermediate quantize launch failed:
+invalid argument" / "Laguna batch prefill failed in routed experts after 1/48
+layers"; short-prompt control 200. Log: ~/bench17/repro_issue.log. Production
+restored after window (is-active, /v1/models 200, chat smoke OK).
+
+Filed (issue only, no fix in hand): https://github.com/antirez/ds4/issues/713
