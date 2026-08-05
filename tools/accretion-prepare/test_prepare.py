@@ -83,6 +83,9 @@ r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), 'pre
                    capture_output=True, text=True)
 sys.stderr.write(r.stderr)
 assert r.returncode == 0
+# preallocation path ran (either fallocate succeeded or warned gracefully)
+assert ('preallocated' in r.stderr) or ('preallocation unavailable' in r.stderr), \
+    'expected preallocation log line in stderr'
 
 og = gguf.read_header(os.path.join(out, 'toy.accretion.gguf'))
 assert og.alignment == 4096

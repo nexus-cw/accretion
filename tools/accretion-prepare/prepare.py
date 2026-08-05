@@ -399,6 +399,22 @@ def main():
     # ---- write ----
     out_sha = hashlib.sha256()
 
+    def preallocate(f, size):
+        """Preallocate `size` bytes contiguously on f's fd (best effort).
+
+        A single up-front posix_fallocate lets the filesystem reserve one
+        (or few) contiguous extent(s) instead of growing the file in
+        fragments as we stream ~150 GiB through it (task #31 rung 1).
+        """
+        try:
+            os.posix_fallocate(f.fileno(), 0, size)
+            log('preallocated %.1f GiB output (posix_fallocate)' % (size / 2**30))
+            return True
+        except (AttributeError, OSError) as e:
+            log('WARNING: preallocation unavailable on target fs (%s); '
+                'output may be fragmented' % e)
+            return False
+
     class HashedFile:
         def __init__(self, f):
             self.f = f
@@ -416,6 +432,7 @@ def main():
     with open(src, 'rb') as fin, open(out_path, 'wb') as fout_raw:
         fout = HashedFile(fout_raw)
         data_start = gguf.write_header(fout, g.metadata, order, alignment)
+        preallocate(fout_raw, data_start + total_out_data)
         for t in order:
             # pad to alignment
             gap = data_start + t.offset - fout.tell()
