@@ -119,10 +119,11 @@ def _arch(g):
     return g.metadata.get('general.architecture', (None, None))[1]
 
 
-from . import deepseek4  # noqa: E402
+from . import deepseek4, laguna_s21  # noqa: E402
 
 REGISTRY = [
     deepseek4.Deepseek4Descriptor(),
+    laguna_s21.LagunaS21Descriptor(),
 ]
 GENERIC = GenericDescriptor()
 
