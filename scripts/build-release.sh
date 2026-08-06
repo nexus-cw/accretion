@@ -7,17 +7,20 @@
 # Run from the accretion repo root ON the target machine for the target:
 #   gb10-arm64-cuda : GB10 / DGX Spark (sm_121a), builds engine with `make cuda-spark`
 #
-# Usage: scripts/build-release.sh [--target gb10-arm64-cuda] [--serial N]
-#   --serial N  date-serial for the 0.1.0-dev.N version (default: 1)
+# Usage: scripts/build-release.sh [--target gb10-arm64-cuda] [--serial N | --version X.Y.Z]
+#   --serial N     date-serial for the 0.1.0-dev.N version (default: 1)
+#   --version X.Y.Z  exact version (milestone releases, e.g. 0.1.0)
 # Output: dist/accretion-<version>-<target>.tar.gz (+ .sha256)
 set -euo pipefail
 
 TARGET=gb10-arm64-cuda
 SERIAL=1
+VERSION_OVERRIDE=
 while [ $# -gt 0 ]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
     --serial) SERIAL="$2"; shift 2 ;;
+    --version) VERSION_OVERRIDE="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -27,7 +30,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 [ -f engine/Makefile ] || { echo "engine/ subtree missing — run from accretion repo root" >&2; exit 2; }
 
-VERSION="0.1.0-dev.${SERIAL}"
+VERSION="${VERSION_OVERRIDE:-0.1.0-dev.${SERIAL}}"
 ACCRETION_COMMIT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 # engine subtree commit: last squash commit records "Squashed 'engine/' changes from X..Y" (or "... (Y)" on the seed commit)
 ENGINE_COMMIT="$(git log --grep="Squashed 'engine/'" -1 --format=%s 2>/dev/null | grep -oE '[0-9a-f]{7,}$' || true)"
