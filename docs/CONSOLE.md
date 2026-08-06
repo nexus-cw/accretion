@@ -27,7 +27,16 @@ side-channel.
   (`base_url http://<host>:8000/v1`), with `<host>` filled from
   `window.location` when JS is available.
 
-v0 is strictly read-only: no settings mutation from the browser.
+- **MODELS** — the model picker (v0.1). Lists every `*.gguf` the server can
+  see (`GET /v1/models/available`): name, size, quant summary, architecture,
+  an `[active]` badge, and a switch button per loadable non-active model.
+  Switching is gated by the admin token (below); without one the picker is
+  read-only with a note. A "prepare a new model" placeholder documents the
+  CLI path (`accretion-prepare <source.gguf>`) — download-from-console is
+  post-v0.1.
+
+Everything except model switching is read-only; switching requires an
+explicitly configured admin token and is disabled by default.
 
 ## `GET /v1/activity`
 
@@ -119,10 +128,52 @@ Idle-priority: refused with `503` unless the server is fully idle (never
 queued behind generation); when admitted it runs on the idle prefill quantum.
 This is the primitive for the ship/install/watch prewarming tiers.
 
+## `GET /v1/models/available`
+
+Scans the active model's directory plus `DS4_MODEL_DIRS` (colon-separated)
+for `*.gguf`. Quant + architecture come from a bounded GGUF header peek,
+cached per (path, size, mtime); `has_manifest` reports a sibling
+`<name>.accretion.manifest.json`; `loadable` is a best-effort arch check
+against what this binary supports (`yes` | `no` | `unknown` — honest
+"unknown" when the header cannot be read).
+
+```json
+{
+  "schema_version": 1,
+  "active_path": "/data/models/ga.gguf",
+  "select_enabled": false,
+  "models": [
+    {"name": "ga.gguf", "path": "/data/models/ga.gguf", "size_bytes": 191111111111,
+     "quant": "Q4_K_M", "architecture": "glm-dsa", "active": true,
+     "has_manifest": true, "loadable": "yes"}
+  ]
+}
+```
+
+## `POST /v1/models/select`
+
+The deliberate-teardown swap (one active model, explicit swap, no
+auto-routing). Body: `{"path": "/abs/path/model.gguf"}`. The server
+validates the path against the scanned list, rewrites `DS4_MODEL=` in the
+env file that drives the unit (`DS4_ENV_FILE`, default
+`/opt/accretion/etc/ds4-server.env` when writable), answers
+`{"status":"swapping", ...}`, drains (stops accepting, finishes in-flight
+generation), and exits with code 42; the systemd unit's
+`Restart=on-failure` restarts it on the new selection. Both drain and total
+swap timings are logged.
+
+**Security gate**: requires `Authorization: Bearer <ACCRETION_ADMIN_TOKEN>`.
+When `ACCRETION_ADMIN_TOKEN` is unset in the server environment, select is
+**disabled** — `405` with an explanatory JSON body — and the console renders
+the picker read-only with a "set admin token to enable switching" note.
+Safe by default: a fresh install cannot have its model switched remotely.
+Wrong token: `401`. Installs not driven by an env file (hand-managed units,
+e.g. a service file with the model path inline): `409` — switch by hand
+until the box migrates to the install layout.
+
 ## v1 roadmap
 
 - prepare-pipeline progress (task #14 UX): live view of accretion-prepare
   stages with per-stage progress and ETA
-- model picker (multiple prepared models on disk, switch which is served)
 - guarded settings mutation (explicit confirm, no silent writes)
 - prewarm status + trigger (expert-cache prewarm from the console)

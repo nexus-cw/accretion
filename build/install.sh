@@ -35,6 +35,14 @@ DS4_EXPERT_CACHE=70GB
 DS4_SESSIONS=2
 DS4_KV_DIR=/var/lib/accretion/kv
 DS4_KV_SPACE_MB=16384
+# Model picker (web console): the server rewrites DS4_MODEL here on
+# POST /v1/models/select, then restarts. DS4_ENV_FILE tells it which file.
+DS4_ENV_FILE=/opt/accretion/etc/ds4-server.env
+# Extra directories to scan for switchable *.gguf models (colon-separated).
+#DS4_MODEL_DIRS=/data/models
+# Set a token to ENABLE model switching from the console/API. Unset =
+# switching disabled (the console shows a read-only picker).
+#ACCRETION_ADMIN_TOKEN=change-me
 EOF
   echo "== wrote default config $PREFIX/etc/ds4-server.env — EDIT DS4_MODEL before starting"
 else
