@@ -9,7 +9,15 @@ DwarfStar (ds4) is the engine; Accretion is the platform around it. The split is
 
 ## Status
 
-Early. Seeded from the nexus-cw/ds4 `platform` branch. Running in production on a GB10 serving DeepSeek V4 Flash MXFP4 at 5-6 tok/s from a 156GB GGUF with a 75GB expert cache.
+**v0.1 reached** (release `v0.1.0`): one install command, browser console,
+model picker (browse + switch the served model, admin-token gated), point
+your harness at it. Seeded from the nexus-cw/ds4 `platform` branch.
+
+Reference box: running in production on a GB10 (robo-dog) serving DeepSeek
+V4 Flash MXFP4 at 5-6 tok/s from a 156GB GGUF with a 70GB expert cache.
+Note: that box predates the install layout — its unit carries the model path
+inline, so console model switching stays disabled there (safe default) until
+it migrates to the env-file layout.
 
 ## Install
 
