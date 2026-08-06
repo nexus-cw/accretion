@@ -28,8 +28,13 @@ side-channel.
   `window.location` when JS is available.
 
 - **MODELS** — the model picker (v0.1). Lists every `*.gguf` the server can
-  see (`GET /v1/models/available`): name, size, quant summary, architecture,
+  see (`GET /v1/models/available`): a **mode badge** (interactive / batch /
+  unknown — see the sidecar convention below) with the recorded reference
+  decode t/s beside it, name, size, quant summary, architecture,
   an `[active]` badge, and a switch button per loadable non-active model.
+  A one-line explainer sits under the list: *interactive: resident, fast
+  decode; batch: streamed, big-model capability*. The active model's mode
+  badge also renders (server-side, JS-free) in **STATUS**.
   Switching is gated by the admin token (below); without one the picker is
   read-only with a note. A "prepare a new model" placeholder documents the
   CLI path (`accretion-prepare <source.gguf>`) — download-from-console is
@@ -145,10 +150,38 @@ against what this binary supports (`yes` | `no` | `unknown` — honest
   "models": [
     {"name": "ga.gguf", "path": "/data/models/ga.gguf", "size_bytes": 191111111111,
      "quant": "Q4_K_M", "architecture": "glm-dsa", "active": true,
-     "has_manifest": true, "loadable": "yes"}
+     "has_manifest": true, "has_sidecar": true, "loadable": "yes",
+     "mode": "batch",
+     "mode_reason": "sidecar flags use --ssd-streaming: experts stream from disk (big-model capability, slower decode)",
+     "decode_tps_reference": 5.4}
   ]
 }
 ```
+
+### Per-model sidecar convention (`<model>.gguf.env`)
+
+A model's proven launch profile lives in a plain `KEY=VALUE` env file next
+to the gguf: `/path/to/model.gguf` → `/path/to/model.gguf.env`. Recognized
+keys:
+
+- `DS4_CTX`, `DS4_CACHE_BUDGET`, `DS4_EXTRA_FLAGS` — **applied on select**:
+  a successful `POST /v1/models/select` copies these into the unit env file
+  along with `DS4_MODEL`, so the restarted server runs the model's proven
+  flags. With a sidecar present, `DS4_CACHE_BUDGET`/`DS4_EXTRA_FLAGS` are
+  written even when absent from it (as empty) so streamed flags never leak
+  onto a resident model; `DS4_CTX` is only overridden when the sidecar sets
+  it non-empty. Without a sidecar, only `DS4_MODEL` changes.
+- `DS4_DECODE_TPS_REFERENCE` — reported (as `decode_tps_reference`), never
+  applied. A **recorded reference measurement**, not a live number.
+
+### Mode semantics (interactive vs batch, first-class)
+
+Derived from the sidecar, one honest rule: sidecar flags containing
+`--ssd-streaming` → **batch** (experts stream from disk: big-model
+capability, slower decode); a sidecar without it → **interactive**
+(resident weights, fast decode); no sidecar, or an architecture this
+binary cannot load → **unknown**. `mode_reason` carries the sentence-form
+justification the console shows as the badge tooltip.
 
 ## `POST /v1/models/select`
 
@@ -170,6 +203,13 @@ Safe by default: a fresh install cannot have its model switched remotely.
 Wrong token: `401`. Installs not driven by an env file (hand-managed units,
 e.g. a service file with the model path inline): `409` — switch by hand
 until the box migrates to the install layout.
+
+Production robo-dog **is** env-file managed as of 2026-08-07: the unit's
+`ExecStart` is parameterized from `/etc/accretion/ds4-server.env`
+(`DS4_MODEL`/`DS4_CTX`/`$DS4_EXTRA_FLAGS`), `DS4_ENV_FILE` points at it,
+`DS4_MODEL_DIRS` scans `/home/jacinta/src/ds4/gguf:/data/gguf`, and swaps
+are exercised live (GA ↔ IQ2, per-model sidecars in place). The old
+"hand-managed unit, switch by hand" caveat no longer applies there.
 
 ## v1 roadmap
 
