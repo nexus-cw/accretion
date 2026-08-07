@@ -125,7 +125,7 @@ REGISTRY = [
     deepseek4.Deepseek4Descriptor(),
     laguna_s21.LagunaS21Descriptor(),
     kimi_k3.KimiK3Descriptor(),      # skeleton: verified=False, never selected
-    inkling.InklingDescriptor(),     # header-verified; verified=False until first prepare run
+    inkling.InklingDescriptor(),     # verified 2026-08-07 prepare run (30720-entry manifest, spot-verify clean)
 ]
 GENERIC = GenericDescriptor()
 

@@ -1,14 +1,13 @@
 """Inkling family descriptor (Thinking Machines; Small = 276B/A12B).
 
-HEADER-VERIFIED, PREPARE-PENDING. Unlike the kimi_k3 skeleton, every
-field below was checked against a real artifact header: the GGUF
-metadata shard + shard-2 tensor table of unsloth/Inkling-Small-GGUF
-UD-IQ2_XXS (parsed 2026-08-07, task #35 S1/S2 -- see
-research/llms/inkling-support-scope.md in the research tree). verified
-stays False only because no end-to-end prepare run has produced and
-spot-checked a manifest yet; flip it after the first S4 prepare run.
-Note ds4 cannot SERVE this arch yet (task #35 S3) -- but prepare and
-serve are independent seams, by design.
+VERIFIED 2026-08-07 (task #35 S2): end-to-end prepare run on robo-dog
+against unsloth/Inkling-Small-GGUF UD-IQ2_XXS (82.3GB merged from 3
+splits): manifest = 30720 expert entries (40 MoE layers x 3 projections
+x 256 experts, exactly as predicted from the header) + 840 dense
+entries; 25-expert + dense spot-verify byte-IDENTICAL at 4096-aligned
+offsets, FAILS=0. Routed expert slices: gate/up 2162688 B (IQ2_XXS),
+down 3211264 B (IQ3_XXS). Note ds4 cannot SERVE this arch yet (task
+#35 S3) -- prepare and serve are independent seams, by design.
 
 Observed facts (Inkling-Small header):
 
@@ -51,7 +50,7 @@ from . import Descriptor
 
 class InklingDescriptor(Descriptor):
     name = 'inkling'
-    verified = False          # header-verified; flip after first prepare run
+    verified = True           # promoted by the 2026-08-07 prepare run (see docstring)
     alignment = 4096
     tensor_aliases = {}       # unsloth GGUF is already canonical
 
