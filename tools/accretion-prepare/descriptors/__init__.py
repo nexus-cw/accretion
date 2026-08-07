@@ -119,12 +119,13 @@ def _arch(g):
     return g.metadata.get('general.architecture', (None, None))[1]
 
 
-from . import deepseek4, laguna_s21, kimi_k3  # noqa: E402
+from . import deepseek4, laguna_s21, kimi_k3, inkling  # noqa: E402
 
 REGISTRY = [
     deepseek4.Deepseek4Descriptor(),
     laguna_s21.LagunaS21Descriptor(),
     kimi_k3.KimiK3Descriptor(),      # skeleton: verified=False, never selected
+    inkling.InklingDescriptor(),     # header-verified; verified=False until first prepare run
 ]
 GENERIC = GenericDescriptor()
 
