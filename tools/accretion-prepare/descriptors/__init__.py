@@ -130,12 +130,19 @@ REGISTRY = [
 GENERIC = GenericDescriptor()
 
 
-def select(g, log=None):
+def select(g, log=None, allow_unverified=False):
     """Pick the first verified descriptor that identifies the header;
-    fall back to the generic (graceful-skip) descriptor."""
+    fall back to the generic (graceful-skip) descriptor. With
+    allow_unverified (promotion runs), an unverified match wins but is
+    loudly logged."""
     for d in REGISTRY:
         if d.identify(g):
             if not d.verified:
+                if allow_unverified:
+                    if log:
+                        log('descriptor %r is UNVERIFIED -- selected anyway '
+                            '(--allow-unverified promotion run)' % d.name)
+                    return d
                 if log:
                     log('descriptor %r matched but is an UNVERIFIED skeleton; '
                         'using generic path' % d.name)

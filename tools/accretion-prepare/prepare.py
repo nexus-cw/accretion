@@ -158,6 +158,10 @@ def main():
     ap.add_argument('--dry-run', action='store_true',
                     help='parse header, select descriptor, plan normalize/'
                          'optimize and print a summary; write nothing')
+    ap.add_argument('--allow-unverified', action='store_true',
+                    help='let an unverified (skeleton) descriptor win '
+                         'selection instead of falling to the generic path; '
+                         'for descriptor promotion runs')
     args = ap.parse_args()
 
     xlog = []
@@ -186,7 +190,8 @@ def main():
 
     # ---- descriptor selection (the arch seam) ----
     arch = g.metadata.get('general.architecture', (None, None))[1]
-    desc = descriptors.select(g, log=log)
+    desc = descriptors.select(g, log=log,
+                              allow_unverified=args.allow_unverified)
     log('descriptor: %s (architecture %r)' % (desc.name, arch))
     xlog.append({'stage': 'select', 'action': 'descriptor',
                  'descriptor': desc.name, 'architecture': arch})
