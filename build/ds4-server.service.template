@@ -10,15 +10,12 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=/opt/accretion/etc/ds4-server.env
 ExecStartPre=/usr/bin/mkdir -p ${DS4_KV_DIR}
-ExecStart=/opt/accretion/bin/ds4-server \
-  -m ${DS4_MODEL} \
-  --cuda --ssd-streaming \
-  --ssd-streaming-cache-experts ${DS4_EXPERT_CACHE} \
-  --host ${DS4_HOST} --port ${DS4_PORT} \
-  --ctx ${DS4_CTX} \
-  --batched-session ${DS4_SESSIONS} \
-  --kv-disk-dir ${DS4_KV_DIR} \
-  --kv-disk-space-mb ${DS4_KV_SPACE_MB}
+# ExecStart runs the arch-swap wrapper, not a server binary directly: it
+# reads DS4_ARCH from this unit's environment and execs the matching
+# binary (ds4-server for deepseek4, ds4-inkling-server for inkling). The
+# per-binary flag sets now live in build/accretion-serve, not here — see
+# docs/CONSOLE.md "Architecture swap" for the full choreography.
+ExecStart=/opt/accretion/bin/accretion-serve
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
