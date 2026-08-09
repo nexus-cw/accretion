@@ -127,3 +127,37 @@ per-backend MoE kernels, which K3 should not need. T3 for K3 would
 then ride the existing deepseek4 streaming path largely for free —
 the same reason its T2 is small. All of this is prediction, flagged
 UNVERIFIED until a K3 GGUF header is read.
+
+## The inkling row
+
+Unlike the other rows above (predictions or upstream diffstats), inkling
+is a completed data point: a **self-contained engine**, not a graph
+module bolted onto `ds4.c`. On the ds4 fork's `inkling-port` branch, the
+family lives in its own files rather than threading `ds4_session_is_*()`
+gates through the shared graph:
+
+- `ds4_inkling.c` (~1700 LOC) — model/graph, weight mapping, sampling
+  path, own session structs.
+- `ds4_inkling_cuda.cu` (~2000 LOC) — CUDA attention + MoE kernels,
+  entirely separate from `ds4_gpu_laguna_*`/`ds4_gpu_stream_expert_*`.
+- A thin server, `ds4-inkling-server` (~850 LOC) — the v1 API subset
+  documented in `docs/CONSOLE.md` ("Architecture swap"): chat
+  completions incl. SSE, capabilities, activity, models,
+  models/available, select. No `/v1/messages`, no `/v1/responses`, no
+  prewarm, no routing-stats.
+
+**Estimate: ~4,550 LOC total** (1700 + 2000 + 850), CUDA-only, no Metal
+or ROCm path yet — call it a **T-tier of its own**: cheaper than T2
+(laguna's ~17.6k insertions across 3 backends threaded into the shared
+graph) because nothing shares code with `ds4.c`/`ds4_cuda.cu` and there
+is no per-backend multiplication yet, but far more than T1 (a ~50–200
+line descriptor) because it is a real second engine, not ingest-only.
+The self-contained-file structure is also why the arch-swap wrapper
+(`build/accretion-serve`) works at all: two independent binaries, no
+shared process state to reconcile on swap.
+
+Pending operator step: `inkling-port` lives on the **ds4 fork**, not yet
+subtree-synced into this repo's `engine/`. `scripts/build-release.sh`'s
+`make -C engine ds4-inkling-server` step fails loudly (naming the
+missing sync) until that subtree sync lands — see the fork's
+`inkling-port` branch and this repo's engine-subtree sync convention.
