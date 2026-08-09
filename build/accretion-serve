@@ -1,0 +1,44 @@
+#!/bin/sh
+# accretion-serve — arch-swap wrapper (ARCH_SEAM / task #26 follow-on).
+#
+# systemd's ExecStart runs this wrapper, not a server binary directly, so
+# that the model picker can swap ARCHITECTURES, not just models: the
+# EnvironmentFile has already been sourced by systemd by the time we run,
+# so DS4_ARCH (and DS4_MODEL/DS4_CTX/etc) are already in our environment.
+# We just exec the binary that matches DS4_ARCH.
+#
+# The swap choreography (see docs/CONSOLE.md "Architecture swap"):
+#   POST /v1/models/select on whichever server is currently running
+#   validates the target, rewrites DS4_MODEL/DS4_ARCH/DS4_CTX/
+#   DS4_CACHE_BUDGET/DS4_EXTRA_FLAGS into the unit env file, drains, and
+#   exits 42. Restart=on-failure re-invokes this wrapper (systemd re-reads
+#   the env file first), which now execs the OTHER binary — the swap
+#   happens entirely through supervisor restart, no privileged re-exec.
+#   Exit 42 from either binary is the trigger; any other nonzero exit is
+#   treated as a real crash by the same Restart=on-failure policy.
+#
+# DS4_ARCH: "inkling" or "deepseek4" (absent = deepseek4, the long-standing
+# default so existing installs need no env-file change).
+set -eu
+
+case "${DS4_ARCH:-deepseek4}" in
+  inkling)
+    exec /opt/accretion/bin/ds4-inkling-server \
+      -m "${DS4_MODEL}" \
+      -c "${DS4_CTX:-65536}" \
+      -p "${DS4_PORT:-8080}" \
+      -H "${DS4_HOST:-0.0.0.0}" \
+      --resident
+    ;;
+  *)
+    exec /opt/accretion/bin/ds4-server \
+      -m "${DS4_MODEL}" \
+      --cuda --ssd-streaming \
+      --ssd-streaming-cache-experts "${DS4_EXPERT_CACHE}" \
+      --host "${DS4_HOST}" --port "${DS4_PORT}" \
+      --ctx "${DS4_CTX}" \
+      --batched-session "${DS4_SESSIONS}" \
+      --kv-disk-dir "${DS4_KV_DIR}" \
+      --kv-disk-space-mb "${DS4_KV_SPACE_MB}"
+    ;;
+esac
