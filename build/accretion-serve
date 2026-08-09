@@ -17,28 +17,35 @@
 #   Exit 42 from either binary is the trigger; any other nonzero exit is
 #   treated as a real crash by the same Restart=on-failure policy.
 #
+# Env contract = the PRODUCTION env file (/etc/accretion/ds4-server.env
+# convention): DS4_MODEL, DS4_CTX, DS4_EXTRA_FLAGS (mode-specific flags —
+# streaming flags for batch mode, --gpu-vram for resident interactive —
+# deliberately unquoted so it word-splits), DS4_KV_DIR, DS4_KV_SPACE_MB,
+# DS4_HOST/DS4_PORT (default 0.0.0.0:8000), DS4_SESSIONS (default 2).
 # DS4_ARCH: "inkling" or "deepseek4" (absent = deepseek4, the long-standing
 # default so existing installs need no env-file change).
 set -eu
 
 case "${DS4_ARCH:-deepseek4}" in
   inkling)
+    # shellcheck disable=SC2086
     exec /opt/accretion/bin/ds4-inkling-server \
       -m "${DS4_MODEL}" \
       -c "${DS4_CTX:-65536}" \
-      -p "${DS4_PORT:-8080}" \
+      -p "${DS4_PORT:-8000}" \
       -H "${DS4_HOST:-0.0.0.0}" \
-      --resident
+      --resident ${DS4_EXTRA_FLAGS:-}
     ;;
   *)
+    # shellcheck disable=SC2086
     exec /opt/accretion/bin/ds4-server \
       -m "${DS4_MODEL}" \
-      --cuda --ssd-streaming \
-      --ssd-streaming-cache-experts "${DS4_EXPERT_CACHE}" \
-      --host "${DS4_HOST}" --port "${DS4_PORT}" \
+      --cuda \
+      --host "${DS4_HOST:-0.0.0.0}" --port "${DS4_PORT:-8000}" \
       --ctx "${DS4_CTX}" \
-      --batched-session "${DS4_SESSIONS}" \
-      --kv-disk-dir "${DS4_KV_DIR}" \
-      --kv-disk-space-mb "${DS4_KV_SPACE_MB}"
+      --batched-session "${DS4_SESSIONS:-2}" \
+      --kv-disk-dir "${DS4_KV_DIR:-/home/jacinta/.ds4/kv}" \
+      --kv-disk-space-mb "${DS4_KV_SPACE_MB:-32768}" \
+      ${DS4_EXTRA_FLAGS:-}
     ;;
 esac
