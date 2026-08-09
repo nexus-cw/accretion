@@ -211,6 +211,79 @@ Production robo-dog **is** env-file managed as of 2026-08-07: the unit's
 are exercised live (GA ↔ IQ2, per-model sidecars in place). The old
 "hand-managed unit, switch by hand" caveat no longer applies there.
 
+## Architecture swap (deepseek4 <-> inkling)
+
+The model picker's deliberate-teardown swap (`POST /v1/models/select`,
+above) was designed for swapping *models*; it extends to swapping
+**architectures** — deepseek4 and inkling are two different server
+binaries, and the box can hold one active model of each family.
+
+**The wrapper**: systemd's `ExecStart` no longer runs a server binary
+directly — it runs `/opt/accretion/bin/accretion-serve`, a thin POSIX
+`sh` wrapper that reads `DS4_ARCH` from the unit's `EnvironmentFile` and
+execs the matching binary:
+
+```sh
+case "${DS4_ARCH:-deepseek4}" in
+  inkling)   exec /opt/accretion/bin/ds4-inkling-server -m "$DS4_MODEL" ... ;;
+  *)         exec /opt/accretion/bin/ds4-server -m "$DS4_MODEL" ... ;;
+esac
+```
+
+`DS4_ARCH` absent means `deepseek4` — existing installs need no env-file
+change to keep working.
+
+**Sidecar convention gains one key**: `DS4_ARCH` (`inkling` or
+`deepseek4`) joins `DS4_CTX`/`DS4_CACHE_BUDGET`/`DS4_EXTRA_FLAGS` in the
+per-model `<model>.gguf.env` sidecar, and is written on select exactly
+like those: a successful `POST /v1/models/select` copies `DS4_MODEL`,
+`DS4_ARCH`, `DS4_CTX`, `DS4_CACHE_BUDGET`, and `DS4_EXTRA_FLAGS` into the
+unit env file, so the wrapper's next invocation execs the right binary
+with the right flags.
+
+**Loadable semantics across families**: `GET /v1/models/available`'s
+`loadable` field is a best-effort check against what *this running
+binary* supports — honestly, a ds4-server process cannot load an
+inkling model, and vice versa. The unit env carries
+`ACCRETION_ARCH_WRAPPER=1` to tell the server it is running under the
+swap-capable wrapper, not launched bare: **a model of the OTHER family
+reports `loadable:yes` only when `ACCRETION_ARCH_WRAPPER=1` is
+present** — without it, cross-arch models correctly report `loadable:no`
+(no wrapper means no restart-into-the-other-binary is possible, so
+offering the switch would be dishonest).
+
+**Swap choreography, step by step**:
+
+1. `POST /v1/models/select {"path": "/data/models/inkling-small.gguf"}`
+   lands on whichever server is currently running (say, `ds4-server`).
+2. It validates the target against the scanned list and the sidecar,
+   then rewrites `DS4_MODEL`/`DS4_ARCH`/`DS4_CTX`/`DS4_CACHE_BUDGET`/
+   `DS4_EXTRA_FLAGS` into `DS4_ENV_FILE`.
+3. It answers `{"status":"swapping", ...}` (`200`) immediately.
+4. It drains: stops accepting new requests, finishes in-flight
+   generation.
+5. It exits with code `42`.
+6. `Restart=on-failure` fires; systemd re-sources the (now-rewritten)
+   `EnvironmentFile` and re-invokes `ExecStart`.
+7. `ExecStart` is `accretion-serve`, which reads the new `DS4_ARCH` and
+   execs `ds4-inkling-server` this time — a different binary than the
+   one that was running a moment ago, on the same unit, same port.
+
+Any other nonzero exit from either binary is a genuine crash, and
+`Restart=on-failure` handles it exactly the same way — the wrapper does
+not distinguish "planned swap" from "crash"; that distinction lives in
+the exit code (`42` vs anything else) and the drain/log lines emitted
+before it.
+
+**Honesty note — `ds4-inkling-server`'s v1 API is a subset**: it serves
+chat completions (including SSE streaming), `GET /v1/capabilities`,
+`GET /v1/activity`, `GET /v1/models`, `GET /v1/models/available`, and
+`POST /v1/models/select`. It does **not** serve `/v1/messages` (no
+Anthropic dialect), `/v1/responses`, `POST /v1/prewarm`, or
+`GET /v1/routing-stats` — those stay `ds4-server`-only for now. The
+console degrades those sections honestly (missing, not silently empty)
+when an inkling model is active.
+
 ## v1 roadmap
 
 - prepare-pipeline progress (task #14 UX): live view of accretion-prepare
