@@ -19,6 +19,8 @@ echo "== verifying manifest"
 
 mkdir -p "$PREFIX"/{bin,tools,etc}
 cp "$HERE"/bin/* "$PREFIX/bin/"
+cp "$HERE/accretion-serve" "$PREFIX/bin/accretion-serve"
+chmod +x "$PREFIX/bin/accretion-serve"
 rm -rf "$PREFIX/tools/accretion-prepare"
 cp -r "$HERE/tools/accretion-prepare" "$PREFIX/tools/"
 cp "$HERE/VERSION" "$PREFIX/VERSION"
@@ -41,6 +43,13 @@ DS4_SERVER_MIXED_PREFILL_QUANTUM=2048
 # Model picker (web console): the server rewrites DS4_MODEL here on
 # POST /v1/models/select, then restarts. DS4_ENV_FILE tells it which file.
 DS4_ENV_FILE=/opt/accretion/etc/ds4-server.env
+# Arch selector: the model picker rewrites DS4_ARCH on select; accretion-serve
+# execs the matching binary (ds4-server for deepseek4, ds4-inkling-server for
+# inkling). ACCRETION_ARCH_WRAPPER=1 tells the running server it is launched
+# under the swap-capable wrapper, so it can honestly report loadable:yes for
+# models of the other family.
+DS4_ARCH=deepseek4
+ACCRETION_ARCH_WRAPPER=1
 # Extra directories to scan for switchable *.gguf models (colon-separated).
 #DS4_MODEL_DIRS=/data/models
 # Set a token to ENABLE model switching from the console/API. Unset =
