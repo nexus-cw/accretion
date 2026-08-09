@@ -39,7 +39,20 @@ ENGINE_COMMIT="$(git log --grep="Squashed 'engine/'" -1 --format=%s 2>/dev/null 
 echo "== build engine ($TARGET)"
 make -C engine cuda-spark
 
-BINARIES="ds4 ds4-server ds4-eval"
+# ds4-inkling-server builds from the engine subtree once the inkling-port
+# branch (ds4 fork) lands in platform via subtree sync — see
+# docs/ARCH_SEAM.md "The inkling row". Until that sync happens the make
+# target below won't exist; fail loudly rather than ship a stale/missing
+# binary in a tagged release.
+echo "== build engine ($TARGET) - ds4-inkling-server"
+make -C engine ds4-inkling-server || {
+  echo "missing engine target ds4-inkling-server — the inkling-port branch" >&2
+  echo "has not been subtree-synced into engine/ yet; sync it (see" >&2
+  echo "docs/ARCH_SEAM.md 'The inkling row') before cutting this release" >&2
+  exit 1
+}
+
+BINARIES="ds4 ds4-server ds4-eval ds4-inkling-server"
 STAGE="$(mktemp -d)"
 PKG="accretion-${VERSION}-${TARGET}"
 mkdir -p "$STAGE/$PKG"/{bin,tools/accretion-prepare}
@@ -51,7 +64,8 @@ done
 
 cp tools/accretion-prepare/*.py tools/accretion-prepare/README.md "$STAGE/$PKG/tools/accretion-prepare/"
 cp build/requirements-accretion-prepare.txt "$STAGE/$PKG/tools/accretion-prepare/requirements.txt"
-cp build/install.sh build/uninstall.sh "$STAGE/$PKG/"
+cp build/install.sh build/uninstall.sh build/accretion-serve "$STAGE/$PKG/"
+chmod +x "$STAGE/$PKG/accretion-serve"
 cp build/ds4-server.service.template "$STAGE/$PKG/"
 cp LICENSE README.md "$STAGE/$PKG/"
 chmod +x "$STAGE/$PKG"/install.sh "$STAGE/$PKG"/uninstall.sh
