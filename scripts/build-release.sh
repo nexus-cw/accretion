@@ -44,7 +44,19 @@ make -C engine cuda-spark
 # docs/ARCH_SEAM.md "The inkling row". Until that sync happens the make
 # target below won't exist; fail loudly rather than ship a stale/missing
 # binary in a tagged release.
-echo "== build engine ($TARGET) - ds4-inkling-server"
+# The inkling server MUST be the CUDA build: the CPU engine is the
+# correctness reference and runs ~25x slower (task #36 shipped a CPU-linked
+# server to production by accident).  Fail the release rather than ship a
+# binary that serves at 0.5 t/s -- ds4-inkling-server-cpu exists for hosts
+# that deliberately want the reference engine.
+if ! command -v nvcc > /dev/null 2>&1; then
+  echo "nvcc not found: ds4-inkling-server must be built with CUDA" >&2
+  echo "(a CPU-linked server serves ~25x slower; see PORT_NOTES.md M10)." >&2
+  echo "Install CUDA or build on the GPU host; refusing to cut a release." >&2
+  exit 1
+fi
+
+echo "== build engine ($TARGET) - ds4-inkling-server (CUDA)"
 make -C engine ds4-inkling-server || {
   echo "missing engine target ds4-inkling-server — the inkling-port branch" >&2
   echo "has not been subtree-synced into engine/ yet; sync it (see" >&2
