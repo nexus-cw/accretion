@@ -49,9 +49,20 @@ make -C engine cuda-spark
 # server to production by accident).  Fail the release rather than ship a
 # binary that serves at 0.5 t/s -- ds4-inkling-server-cpu exists for hosts
 # that deliberately want the reference engine.
+# Look where the engine Makefile actually looks, not just on PATH: a
+# non-interactive ssh session on the GPU host has CUDA installed but not
+# exported, which made this guard reject a perfectly good build host.
+if ! command -v nvcc > /dev/null 2>&1; then
+  for cand in "${NVCC:-}" /usr/local/cuda/bin/nvcc /opt/cuda/bin/nvcc; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+      PATH="$(dirname "$cand"):$PATH"; export PATH; break
+    fi
+  done
+fi
 if ! command -v nvcc > /dev/null 2>&1; then
   echo "nvcc not found: ds4-inkling-server must be built with CUDA" >&2
   echo "(a CPU-linked server serves ~25x slower; see PORT_NOTES.md M10)." >&2
+  echo "Searched: PATH, \$NVCC, /usr/local/cuda/bin, /opt/cuda/bin." >&2
   echo "Install CUDA or build on the GPU host; refusing to cut a release." >&2
   exit 1
 fi
