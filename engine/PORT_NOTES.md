@@ -460,3 +460,310 @@ Operator steps to make Inkling console-live:
    ~343s before first token; /v1/capabilities appears when up).
 5. Full resident multi-session validation in that window (not
    testable beside production).
+
+## M10: the server was running the CPU engine (task #36, 2026-08-10)
+
+The bug: Makefile built ds4-inkling-server from ds4_inkling_server.c +
+ds4_inkling.c with $(CC) and NO CUDA translation unit, so console-live
+Inkling was served by the correctness-reference CPU engine -- ~2.1 s/
+token and 0.88 t/s prefill against the CLI's 81.5 ms/token and 11.0
+t/s. The banked 12.3 t/s sidecar value was a CLI number the server
+could never deliver. It was invisible because nothing in the API
+reported which engine was live; the M9 API gate checked response
+SHAPES and never timed a token.
+
+Fixes:
+- ds4-inkling-server now links ds4_inkling_cuda.cu via nvcc (main()
+  gated by DS4_INKLING_NO_MAIN) and dispatches prefill AND decode
+  through ink_forward_gpu with the split device arena
+  (ink_cuda_make_resident, exported for the server). Prefill batches at
+  the GPU chunk (128), not 32.
+- --cpu / DS4_INKLING_BACKEND=cpu selects the reference engine;
+  ds4-inkling-server-cpu builds it CUDA-free for hosts without nvcc.
+  The CPU engine is NOT deleted -- it is the correctness oracle.
+- /v1/capabilities reports serving.backend ("cuda"|"cpu") so this class
+  of mistake is visible from the console instead of a stopwatch.
+- accretion scripts/build-release.sh refuses to cut a release without
+  nvcc rather than silently shipping a CPU-linked server.
+- Logits corruption now fails the REQUEST, not the process:
+  ink_logits_ok() is the non-fatal form; checked once after prefill
+  (clean 500, nothing sent yet) and per decode step (500, or an SSE
+  error event when frames are already streaming). CLIs keep the fatal
+  ink_logits_guard.
+
+Verified beside production (could not restart it, see below):
+- Server starts on the GPU engine: "backend cuda", split arena line
+  "3.5 GiB device / 0.5 GiB host", /v1/capabilities serving.backend
+  "cuda".
+- --cpu path starts and serves: "backend cpu", API returns content
+  "The user" for {"messages":[{"role":"user","content":"Capital of
+  France?"}],"max_tokens":3,"temperature":0} (286.9 s -- the CPU
+  engine's real speed, and the reference string for the window check).
+- Guard-to-500 proven for real: the paged test instance tripped the
+  known reclaim-NaN class and returned
+  {"error":{"message":"logits corruption detected..."}} with HTTP 500,
+  and the PROCESS SURVIVED (capabilities 200, activity idle, pid
+  alive). Before this change that was exit(3).
+
+NOT measured: through-the-API decode/prefill t/s. That needs the
+service restarted onto the new binary, which this session's permission
+layer denies (systemctl blocked, as in M5/M9). The binary is staged at
+/opt/accretion/bin/ds4-inkling-server.new. The sidecar's
+DS4_DECODE_TPS_REFERENCE=12.3 / prefill 11.0 remain CLI-measured
+numbers and should be REPLACED with the through-API measurements from
+the run below; expect them slightly under the CLI (per-request state
+reset, chat-template tokens, HTTP framing).
+
+Operator steps (deploy + measure):
+  sudo install -m 755 /opt/accretion/bin/ds4-inkling-server.new \
+      /opt/accretion/bin/ds4-inkling-server
+  sudo systemctl restart ds4-server
+  # confirm the engine is the GPU one BEFORE trusting any number:
+  curl -s localhost:8000/v1/capabilities   # serving.backend must be "cuda"
+  # correctness (must return content "The user"):
+  curl -s -X POST localhost:8000/v1/chat/completions \
+    -H Content-Type:application/json \
+    -d '{"messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":3,"temperature":0}'
+  # decode t/s through the API (32 tokens, watch total time):
+  time curl -s -X POST localhost:8000/v1/chat/completions \
+    -H Content-Type:application/json \
+    -d '{"messages":[{"role":"user","content":"Write one paragraph about rivers."}],"max_tokens":32,"temperature":0}'
+  # prefill t/s through the API: poll /v1/activity during a long-prompt
+  # request and read prefill.tokens_per_second.
+Then update the sidecar DS4_DECODE_TPS_REFERENCE to the measured value.
+
+## M11: int8/dp4a fast path -- fast, numerically sound, and NOT SHIPPABLE
+
+Built (llama.cpp ggml-cuda/vecdotq.cuh technique, MIT, adapted): the
+grouped expert matvecs quantize the activation once per grouped call to
+int8 blocks of 32, then do 8 __dp4a integer dots per 32 weights instead
+of 32 float FMAs, with the codebooks staged in shared memory. Applied
+to IQ2_XXS + IQ3_XXS (the decode carriers) only. Scaling stays pure
+float with the verified db formulas (deliberately not llama.cpp's
+integer sumi*ls/8). Sign application uses a scalar per-byte negate, not
+__vcmpne4/__vsub4 -- a known perf residual.
+
+Speed (bench-layers 2, 6-expert grouped, real decode shape):
+  gate_exps IQ2_XXS  FAST 69.3 GB/s  vs EXACT 50.8  (+36%)
+  up_exps   IQ2_XXS  FAST 69.3       vs EXACT 44.8  (+55%)
+  down_exps IQ3_XXS  FAST 60.5       vs EXACT 42.5  (+42%)
+
+Numerics at matvec granularity: err/ref_rms = 0.297-0.300% against the
+CPU f32 reference, with ref_rms ~4.8-5.5 -- i.e. EXACTLY the int8
+activation-quantization floor. The kernel is not buggy at this level.
+(The harness now prints ref_rms/ref_absmax so this is read off, not
+inferred: an earlier reading of mine called maxreldiff=39.7 "noise near
+zero" and moved on, which was the wrong instinct -- the loose-bound
+flag was right to fire.)
+
+END-TO-END, HOWEVER, IT CHANGES GENERATIONS:
+  prompt "The capital of France is" -> FAST and EXACT identical
+    (12650/13/12650/382/290, " Paris. Paris is the")
+  prompt "The three largest planets in the solar system are"
+    EXACT: " the three largest planets"  (top-1 logit 14.52)
+    FAST:  "The user is asking"          (top-1 logit 12.22)
+A 2.3-logit, 16%-lower top-1 is not what 0.3% per-matvec noise looks
+like after one layer; it is what it looks like after 40 MoE layers of
+accumulation into a 2-bit model's residual stream, or what an
+only-in-full-forward bug looks like. Both hypotheses are open.
+DEFAULT IS THEREFORE THE EXACT PATH (committed); INK_FAST_DEQUANT=1
+opts in for investigation only. Nothing was deployed: the staged
+/opt/accretion/bin/ds4-inkling-server.new is the exact-default build
+(an earlier staging with FAST as default was replaced -- do not deploy
+any binary built before 2026-08-10 18:05).
+
+Projected gain had it been shippable: grouped pool ~39ms -> ~28ms of an
+81.5ms CLI decode => ~70ms CLI, ~10.3 t/s through the API (+12% over
+9.2). Modest, because the remaining decode time is now dominated by
+pools dp4a never touched: Q5_K attention/shexp (~26ms) and the Q4_K
+output head (~7ms).
+
+Answer to the "is it an ALU wall / should we repack to MXFP4" question:
+NOT YET, and the evidence says the ALU levers are not exhausted. Even
+on the fast path the kernels sit ~3.3x below the 225 GB/s device
+ceiling, and three known-unexhausted causes remain, in my order of
+expected value:
+  1. scalar sign construction (ink_pack_signed4 does a 4-iteration
+     per-byte negate where llama.cpp does __vcmpne4 + XOR + __vsub4 --
+     roughly 4x the ALU ops in the innermost loop);
+  2. no ILP/occupancy work at all (rows-per-warp, wider per-thread
+     work; the builder deferred it as too risky to write blind);
+  3. redundant requantization -- gate and up quantize the SAME
+     activation vector twice per layer.
+MXFP4 repacking doubles bytes/token (2.4 -> ~4.8 GiB) to buy near-free
+dequant; at a realistic 150-200 GB/s that is ~24-32ms/token, which a
+fully-optimized dp4a path (2.4 GiB at 120-150 GB/s = 16-20ms) should
+still beat. I would exhaust 1-3 before scoping a prepare-pipeline
+change.
+
+Next-round recommendation (in order): fix the divergence (bisect by
+running the fast path in ONE layer at a time to see whether error
+accumulates smoothly or jumps -- that discriminates accumulation from
+bug); then SIMD sign construction; then extend dp4a to the K-quants,
+which is where the remaining decode time actually is.
+
+## M12: divergence bisect -- verdict ACCUMULATION, not a bug
+
+Harness: INK_FAST_LAYERS=none|all|N|LO-HI gates the dp4a path per layer,
+INK_FAST_TYPES=both|iq2|iq3 gates it per quant type (for this artifact
+iq2 = gate/up, iq3 = down), --logits-out dumps the full logits vector so
+every step is diffed against the all-exact reference. One generated
+token per run (the logits after prefill are what matter).
+
+Sweep, prompt "The three largest planets in the solar system are"
+(reference top-1 id=290 ' the', logit 14.5164):
+  fast layers   top1     logit     max|dlogit|   token
+  none          290      14.5164   0.00000       same
+  0             290      14.5164   0.00000       same
+  0-1           290      14.5164   0.00000       same
+  0-3           79575    13.9833   2.66460       CHANGED
+  0-7           279      10.7750   5.46189       CHANGED
+  0-15          976      12.2558   7.42159       CHANGED
+  0-31          976      12.2265   7.37926       CHANGED
+  all           976      12.2241   7.39743       CHANGED
+Same sweep, "The capital of France is": token NEVER changes, max|dlogit|
+stays in 0.18-0.60 -- a high-confidence prompt absorbs the perturbation.
+
+Follow-ups (all layers unless noted), planets prompt:
+  iq2 only (gate/up)   top1 290 same   max|dlogit| 1.59518
+  iq3 only (down)      top1 290 same   max|dlogit| 2.12886
+  layers 32-41 only    top1 290 same   max|dlogit| 0.06307
+  layers 20-41 only    top1 290 same   max|dlogit| 0.09527
+  both types, all      top1 976 CHANGED max|dlogit| 7.39743
+
+VERDICT: accumulation. Five independent pieces of evidence, no
+discontinuity anywhere:
+1. Layers 0-1 are the DENSE blocks -- no expert matvecs, and the delta
+   is exactly 0.00000, so the gating is sound and nothing leaks.
+2. Growth across the sweep is monotone then saturating (2.66 -> 5.46 ->
+   7.42 -> 7.38 -> 7.40). A bug in one layer/expert/edge case would show
+   as a jump at a specific step; there is none.
+3. Neither quant type dominates (1.60 vs 2.13) -- inconsistent with a
+   format-specific coding defect in one dequantizer. It also refutes my
+   own heavy-tail hypothesis: post-SiLU inputs (iq3) are only modestly
+   worse than post-rmsnorm inputs (iq2), not categorically worse.
+4. The effect is governed by DEPTH POSITION, smoothly: the last 10
+   layers cost 0.063, the last 22 cost 0.095, all 40 cost 7.40. Error
+   injected early is amplified by the remaining layers; error injected
+   late has no depth left to amplify it. A bug would not track position
+   this cleanly.
+5. The two types are strongly super-additive (1.60 + 2.13 = 3.7 alone,
+   7.40 together), the signature of nonlinear amplification through a
+   deep 2-bit model rather than additive noise.
+So the int8 activation floor (measured 0.30% per matvec on synthetic
+data) is real and irreducible at this precision, and 40 MoE layers of a
+2-bit model amplify it past the point where top-1 survives on
+lower-confidence prompts.
+
+IS dp4a USABLE ANYWHERE? Yes, but the honest win is small:
+- SAFE: late layers. Layers 20-41 (22 of 40 MoE layers, ~55% of expert
+  traffic) move the logits by 0.095 and change no token on either
+  prompt. The output head (Q4_K, the very last matvec) is by the same
+  argument the safest place of all -- nothing downstream to amplify.
+- NOT SAFE: early/middle layers, at any precision int8 can offer.
+- Expected gain if we took the safe part: expert pool ~39ms of an
+  81.5ms decode, 55% of it at +40% => ~6ms, i.e. ~75ms CLI / ~9.8 t/s
+  through the API, +7% over 9.2. Adding the head is maybe +3ms more.
+Recommendation: do NOT adopt dp4a for a ~7-10% gain that costs a
+behavioural change we would have to re-validate on every prompt class.
+Spend the next round on the numerics-PRESERVING levers instead, which
+are untouched and which the exact path also benefits from: ILP and
+occupancy (rows-per-warp, wider per-thread work) on the exact kernels,
+which still sit at 42-54 GB/s against a 225 GB/s device ceiling -- a 4x
+gap that costs nothing in accuracy to attack. Revisit dp4a only if a
+late-layers-only mode is wanted after that, and only with the sweep
+above rerun as its gate.
+
+Higher-precision activations: not promising. The failure is depth
+amplification of a per-matvec error, so a 2x-finer activation grid buys
+roughly one extra sweep step of headroom, not a category change; fp16
+activations would abandon dp4a (which is the entire point of the
+exercise). Nothing shipped this round: exact remains the default, and
+no binary was deployed.
+
+## M13: numerics-preserving round -- expert pool +16-49%, identity held
+
+Changes (all in ink_matvec_row_warp + three dq32_*, shared by the exact
+single AND grouped kernels; no fast/dp4a path, quantizer or server
+touched):
+1. 2-way ILP: the lane's dependent dequant->dot->acc chain became two
+   independent accumulators over paired subgroups (sg, sg+32), merged in
+   fixed order before the unchanged shuffle reduction. This is a bounded
+   deterministic REASSOCIATION, not bit-identical -- of the same kind
+   already present in the warp reduction and the float4 grouping.
+2. dq32_q5_K: ql/qh read as 8x4-byte words instead of 32 byte loads,
+   loop-invariant nibble-mask selection hoisted.
+3. dq32_iq2_s: sign-bit XOR (bitwise identical to *-1.f), which the
+   other IQ dequantizers have had since M8.
+Declined by the builder, reasoning accepted: cross-block activation
+dedup (shared memory is per-block; needs a persistent/two-pass kernel)
+and dynamic extern __shared__ sizing (unverifiable blind; silent shared
+corruption is exactly what this round guards against).
+
+IDENTITY GATE -- PASS:
+  selftest matrix (layers 0, 2): all PASS at unchanged tight bounds.
+  planets prompt: top-1 id 290 -> 290, logit 14.516440 -> 14.516437,
+                  full-vector max|dlogit| = 2.06e-05
+  france prompt:  top-1 id 12650 -> 12650, logit 18.536530 -> 18.536531,
+                  full-vector max|dlogit| = 7.63e-06
+Both deltas are fp-reassociation noise, below the selftest's own
+gpu_vs_cpu spread (~4e-05). No token changed.
+
+SPEED, grouped 6-expert at decode shape (rotating over 12 distinct
+expert sets so nothing sits in L2):
+  gate_exps IQ2_XXS  45.30 -> 56.16 GB/s  (+24%)
+  up_exps   IQ2_XXS  48.80 -> 56.61       (+16%)
+  down_exps IQ3_XXS  41.81 -> 62.39       (+49%)
+Per 6-expert set per layer: 1.0132 ms -> 0.7691 ms, i.e. the routed
+expert pool is 24% cheaper. Over 40 MoE layers that is ~40.5 ms ->
+~30.8 ms, saving ~9.8 ms of an 81.5 ms decode.
+
+MEASUREMENT WARNING (recorded in the harness output too): the
+SINGLE-TENSOR bench numbers moved the OTHER way -- wq/wo Q5_K 175 ->
+142 GB/s, gate_exps 70 -> 60. That is the builder's register-pressure
+risk showing up exactly where it should: a single 2-19 MB slice hit 20x
+is L2-RESIDENT, so 2-way ILP costs registers/occupancy while hiding
+latency that does not exist in that regime. Real decode streams six
+experts chosen fresh per layer out of a 76 GiB arena with no reuse --
+the rotating grouped table is the representative one. Earlier notes'
+single-tensor GB/s figures were partly measuring cache and should be
+read with that caveat.
+
+Projected: ~9.8 ms saved on the expert pool, plus whatever the Q5_K
+wide loads give attention in the streaming regime (unmeasurable here
+because the single-tensor bench is in-cache) => ~70-72 ms CLI decode,
+~10.2-10.6 t/s through the API vs 9.2 measured (+11-15%). NOT measured
+end-to-end: the permission layer denies systemctl restart, so the
+staged binary could not be exercised through the API.
+
+Where the time sits afterward, and the bandwidth question: nothing is
+bandwidth-bound yet. The expert pool now runs at 56-62 GB/s against a
+225 GB/s device ceiling, and the dp4a path -- which removes dequant ALU
+entirely -- reaches only 63-66 GB/s on the same shapes. That
+convergence is the informative part: after M13 the exact path is within
+7-11% of the ALU-free path on gate/up and has CAUGHT it on down_exps
+(62.4 vs 62.8). So dequant ALU is no longer the dominant cost; whatever
+now limits both paths is shared (memory latency/occupancy at these
+shapes), and dp4a's remaining advantage has essentially evaporated --
+another reason not to revisit it.
+Next lever, if more decode speed is wanted, is therefore NOT more ALU
+work on these kernels: it is occupancy/latency (persistent kernels,
+dynamic shared sizing, or fusing gate+up so one weight stream feeds two
+outputs), or the prepare-time MXFP4 repack. I would measure a resident
+end-to-end run first -- three of the last four rounds' projections were
+distorted by benchmarking artifacts, and only the API number settles it.
+
+Operator steps to measure M13 through the API:
+  sudo install -m 755 /opt/accretion/bin/ds4-inkling-server.new \
+      /opt/accretion/bin/ds4-inkling-server
+  sudo systemctl restart ds4-server
+  curl -s localhost:8000/v1/capabilities        # backend must be "cuda"
+  curl -s -X POST localhost:8000/v1/chat/completions -H Content-Type:application/json \
+    -d '{"messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":3,"temperature":0}'
+    # expect content "The user" (unchanged from M10 -- identity gate)
+  time curl -s -X POST localhost:8000/v1/chat/completions -H Content-Type:application/json \
+    -d '{"messages":[{"role":"user","content":"Write one paragraph about rivers."}],"max_tokens":32,"temperature":0}'
+    # decode t/s: expect ~10.2-10.6 vs 9.2 baseline
+If decode does NOT improve, revert ONLY the ILP hunk (keep the Q5_K
+wide loads and the iq2_s sign XOR, which are strict wins) -- the ILP is
+the only change whose benefit depends on the streaming regime.
